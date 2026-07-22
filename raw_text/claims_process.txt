@@ -1,0 +1,37 @@
+
+Health Insurance Claims Processing Guide & Checklist
+Document ID: SOP-OPS-042
+Effective Date: January 1, 2026
+Version: 3.2
+1. Process Overview
+This document outlines the standard operating procedures for submitting, reviewing, and adjudicating health insurance claims. Follow these steps to ensure compliance, minimize processing delays, and prevent claim denials.
+[Provider/Patient]       [Triage & Scan]       [Adjudication]       [Final Payout]
+  Submits Claim    --->   Verifies Data  --->   Applies Policy  --->   Issues EOB
+2. Step-by-Step Workflow
+Step 1: Claim Intake & Formatting
+Electronic claims must be submitted via the standard EDI 837 format.
+Paper claims must use the official, original red-ink CMS-1500 or UB-04 forms.
+Black-and-white photocopies of paper forms will be automatically rejected by the optical character recognition (OCR) scanner. [1, 2]
+Step 2: Member and Provider Verification
+Match the patient’s Member ID, group number, and date of birth against the active enrollment registry.
+Cross-reference the billing provider's National Provider Identifier (NPI) to confirm network participation status.
+Step 3: Medical Adjudication
+Validate that all diagnostic codes (ICD-10-CM) align logically with the billed procedure codes (CPT/HCPCS).
+Review the patient's plan files to calculate deductible tracking, co-insurance percentages, and out-of-pocket maximums. [1]
+Step 4: Final Settlement & Notification
+Generate the final payment or issue a formal denial notice within 30 business days of initial receipt.
+Distribute the Explanation of Benefits (EOB) statement directly to the member.
+3. Claim Auditor Checklist
+The processing agent must verify and check off each item before finalizing adjudication:
+Patient Demographics: Name matches the insurance card exactly.
+Prior Authorization: Active authorization number is attached for inpatient or specialized services.
+Timely Filing Window: Claim was submitted within 180 days of the date of service.
+Coordination of Benefits (COB): Primary insurance payment details are attached if this plan is secondary.
+Code Integrity: No unbundled CPT codes or invalid modifiers are present. [1, 2]
+4. Error Resolution Codes
+
+--- Table Data ---
+Error Code | Root Cause Description | Immediate Action Required
+ERR-102 | Missing or invalid member ID number | Reject claim; return to sender for identity verification.
+ERR-305 | No prior authorization on file | Forward to the medical necessity review board for retrospective audit.
+ERR-501 | Duplicate billing detected | Deny line item; cross-reference with the previously paid historical claim ID.

@@ -16,7 +16,7 @@ def generate_answer(question: str, context: str) -> str:
     """
     # 2. FIXED: Instantiate the official client seamlessly
     client = Groq(
-        api_key="API_KEY_REDACTED_FOR_SECURITY"  # Replace
+        api_key="GROQ_API_KEY"  # Replace with your actual API key
     )
 
     # STRICT GROUNDING PROMPT COMPLIANCE

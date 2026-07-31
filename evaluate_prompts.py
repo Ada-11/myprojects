@@ -108,7 +108,7 @@ def score_response(variant_key, question, answer, context):
 # 4. TESTING ORCHESTRATION & COMPARISON ENGINE
 # ---------------------------------------------------------
 def execute_matrix_evaluation():
-    client = Groq(api_key="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")
+    client = Groq(api_key="GROQ_API_KEY")  # Replace with your actual API key
     
     project_root = "/Users/ada/myprojects/my-first-app"
     output_md_path = os.path.join(project_root, "prompt_variants.md")

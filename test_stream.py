@@ -7,7 +7,7 @@ def test_groq_streaming_call():
     
     # 1. Initialize the official native Groq client
     client = Groq(
-        api_key="API_KEY_REDACTED_FOR_SECURITY"  # Replace
+        api_key="GROQ_API_KEY"  # Replace with your actual API key
     )
 
     test_question = "What is a brief summary of how high-speed LPU chips process tokens?"

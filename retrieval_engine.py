@@ -141,10 +141,10 @@ def retrieve(question: str) -> dict:
     if classification == "structured":
         structured_raw = sql_lookup(question)
     elif classification == "unstructured":
-        unstructured_raw = vector_lookup(question, limit=5)
+        unstructured_raw = vector_lookup(question, limit=2)
     elif classification == "both":
         structured_raw = sql_lookup(question)
-        unstructured_raw = vector_lookup(question, limit=5)
+        unstructured_raw = vector_lookup(question, limit=2)
         
     # 3. MERGE & DE-DUPLICATE RESULTS INTO ONE CONTEXT BLOCK
     context_lines = []

@@ -267,3 +267,93 @@ This is a structural coverage determination based on exact policy terms. This is
 | #4 | How much will I pay out-of-pocket for knee surgery under my plan P101? | estimate_out_of_pocket_cost | `estimate_out_of_pocket_cost` | `[{"plan_id": "P101", "procedure": "knee surgery"}]` | ✅ PASSED |
 | #5 | I want to look up my coverage for routine evaluations under plan P102 and also check the deductible details for plan P102. | MULTIPLE (check_coverage + get_plan_details) | `get_plan_details + check_coverage` | `[{"plan_id": "P102"}, {"plan_id": "P102", "procedure": "routine evaluations"}]` | ✅ PASSED |
 | #6 | Hi, I am stressed about my medical bills. Can you tell me a joke to cheer me up? | NONE (Conversational Fallback) | `NONE` | `"N/A"` | ✅ PASSED |
+
+
+### 📜 Live Agent Execution Transaction Log
+*   **Timestamp:** `2026-08-05T21:33:59Z`
+*   **User Incoming Request Query:** "What is the current status of claim CLM9901?"
+
+| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |
+| :--- | :--- | :--- |
+| `get_claim_status` | `{"claim_id": "CLM9901"}` | `{"claim_id":"CLM9901","status":"paid","submitted_amount":450.0,"allowed_amount":350.0,"member_responsibility":35.0,"insurance_paid":315.0,"denial_reason":null}` |
+
+
+### 📜 Live Agent Execution Transaction Log
+*   **Timestamp:** `2026-08-05T21:34:48Z`
+*   **User Incoming Request Query:** "What is the current status of claim CLM9901?"
+
+| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |
+| :--- | :--- | :--- |
+| `get_claim_status` | `{"claim_id": "CLM9901"}` | `{"claim_id":"CLM9901","status":"paid","submitted_amount":450.0,"allowed_amount":350.0,"member_responsibility":35.0,"insurance_paid":315.0,"denial_reason":null}` |
+
+**Final Natural-Language Agent Output Response:**
+```text
+Claim CLM9901 has been paid in full. The submitted amount was $450.00, and the allowed amount was $350.00. Your member responsibility was $35.00, and the insurance paid $315.00. There is no denial reason associated with this claim.
+
+This is a structural coverage determination based on exact policy terms. This is not medical advice.
+```
+--------------------------------------------------------------------------------
+
+
+### 📜 Live Agent Execution Transaction Log
+*   **Timestamp:** `2026-08-05T21:53:38Z`
+*   **User Incoming Request Query:** "What is my annual deductible under plan P101?"
+
+| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |
+| :--- | :--- | :--- |
+| `get_plan_details` | `{"plan_id": "P101"}` | `{"plan_id":"P101","plan_name":"Gold PPO","monthly_premium":500.0,"annual_deductible":2000.0,"copay_pct":10,"out_of_pocket_maximum":4000.0,"network_tier":"GOLD"}` |
+
+**Final Natural-Language Agent Output Response:**
+```text
+Based on the plan details, your annual deductible under plan P101 is $2,000. 
+
+For your reference, a deductible is the amount you pay for healthcare services before your insurance plan starts to cover costs. In this case, you'll need to pay the first $2,000 of your medical expenses each year before your plan kicks in.
+```
+--------------------------------------------------------------------------------
+
+
+### 📜 Live Agent Execution Transaction Log
+*   **Timestamp:** `2026-08-05T21:54:48Z`
+*   **User Incoming Request Query:** "Is outpatient physical therapy covered under this plan?"
+
+| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |
+| :--- | :--- | :--- |
+| `check_coverage` | `{"plan_id": "P101", "procedure": "physical therapy"}` | `{"plan_id":"P101","procedure":"physical therapy","is_covered":true,"limitations":"Covered up to 20 visits per calendar year.","pre_authorization_required":false}` |
+
+**Final Natural-Language Agent Output Response:**
+```text
+Based on the plan details, outpatient physical therapy is covered under this plan. You are eligible for up to 20 visits per calendar year, and pre-authorization is not required. However, please note that any additional services or treatments may be subject to review and approval.
+
+A deductible is a fixed amount you must pay out-of-pocket for healthcare services before your insurance plan starts covering the costs. In this plan, the deductible is $1,500 per individual or $3,000 per family. This means that you will need to pay the first $1,500 (or $3,000 for a family plan) of your medical expenses before your insurance plan starts covering the costs.
+
+This is a structural coverage determination based on exact policy terms. This is not medical advice.
+```
+--------------------------------------------------------------------------------
+
+
+### 📜 Live Agent Execution Transaction Log
+*   **Timestamp:** `2026-08-05T21:55:10Z`
+*   **User Incoming Request Query:** "What do I pay for an emergency room visit if I am not admitted?"
+
+| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |
+| :--- | :--- | :--- |
+| `estimate_out_of_pocket_cost` | `{"plan_id": "P101", "procedure": "emergency room visit, not admitted"}` | `{"error": "Custom out-of-pocket projection details unavailable."}` |
+| `get_plan_details` | `{"plan_id": "P101"}` | `{"plan_id":"P101","plan_name":"Gold PPO","monthly_premium":500.0,"annual_deductible":2000.0,"copay_pct":10,"out_of_pocket_maximum":4000.0,"network_tier":"GOLD"}` |
+
+**Final Natural-Language Agent Output Response:**
+```text
+Based on the plan details, if you visit the emergency room and are not admitted, you will need to pay the copay percentage of the total bill, which is 10% of the total cost. 
+
+To estimate the out-of-pocket cost, let's assume the total bill for the emergency room visit is $10,000. 
+
+Your copay would be 10% of $10,000, which is $1,000. 
+
+However, since you have a deductible of $2,000, you would need to pay the deductible first, which is $2,000. 
+
+After paying the deductible, your out-of-pocket cost for the emergency room visit would be $1,000 (copay) + $2,000 (deductible) = $3,000.
+
+You would still need to pay the remaining balance of $7,000 ($10,000 - $3,000) out-of-pocket, but this would not count towards your out-of-pocket maximum of $4,000.
+
+So, your estimated out-of-pocket cost for the emergency room visit would be $3,000 + $7,000 = $10,000.
+```
+--------------------------------------------------------------------------------

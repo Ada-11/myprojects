@@ -83,7 +83,6 @@ def check_coverage(plan_id: str, procedure: str) -> str:
         raw_match = {"plan_id": plan_id, "procedure": procedure, "is_covered": False, "limitations": "No record found.", "pre_authorization_required": False}
         
     try:
-        # TEACHER INSTRUCTION COMPLIANCE: Instantiate Pydantic structural data parser validation block
         validated_data = CoverageValidationModel(**raw_match)
         return validated_data.model_dump_json()
     except ValidationError as ve:
@@ -205,11 +204,11 @@ TOOLS_SCHEMAS = [
 # ---------------------------------------------------------
 # 5. AGENT INTERACTIVE RUNTIME MULTI-TURN PIPELINE LOOP
 # ---------------------------------------------------------
-def run_agent_loop(user_query: str):
+def run_agent_loop(user_query: str, external_context: str = "") -> str:
     api_key_env = os.environ.get("GROQ_API_KEY")
     if not api_key_env:
-        print("[ERROR] GROQ_API_KEY environment variable not set. Run 'export GROQ_API_KEY=...' first.")
-        return
+        print("[ERROR] GROQ_API_KEY environment variable not set.")
+        return "Error: Internal server credential setup missing."
 
     client = Groq(api_key=api_key_env)
     output_md_path = "/Users/ada/myprojects/my-first-app/tool_call_log.md"
@@ -218,17 +217,17 @@ def run_agent_loop(user_query: str):
         "You are an advanced health insurance navigation assistant combining structural compliance limits with an accessible, professional tone.\n"
         "1. ACCURATE AND EMPATHETIC BALANCE: State all tool-returned metrics, deductibles, and coverage statuses with literal precision.\n"
         "2. MEDICAL DEFLECTION GUARDRAIL: If the user mentions health symptoms, state clearly that you cannot evaluate conditions and direct them to their doctor.\n"
-        "3. OUT-OF-BOUNDS FALLBACK: If the tools don't return meaningful data, state: 'I don't know. The requested policy data is not present within your plan files.'\n"
+        "3. TERMINOLOGY GUARDRAIL: Always define 'deductible' in plain language on first use.\n"
         "4. STANDARD CLOSING DISCLAIMER: Conclude with this exact standalone paragraph: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'"
     )
+
+    if external_context:
+        system_prompt += f"\n\nRetrieved RAG Context Layer Material:\n{external_context}"
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_query}
     ]
-
-    print(f"\n[USER QUERY]: \"{user_query}\"")
-    print("[PROCESSING] Querying Groq cloud with tool parameters...")
 
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
@@ -238,12 +237,10 @@ def run_agent_loop(user_query: str):
         temperature=0.0
     )
 
-    # FIXED: Added [0] index array accessor layout resolution matching updated SDK specifications
     response_message = response.choices[0].message
     tool_calls = response_message.tool_calls
 
     if tool_calls:
-        print(f"[AGENT STATE] Found {len(tool_calls)} functional call dependencies. Executing validation gates...")
         messages.append(response_message)
 
         available_functions = {
@@ -253,7 +250,6 @@ def run_agent_loop(user_query: str):
             "estimate_out_of_pocket_cost": estimate_out_of_pocket_cost
         }
 
-        # Open your verification document file using append mode to log audit trails
         with open(output_md_path, "a", encoding="utf-8") as out:
             out.write("\n\n### 📜 Live Agent Execution Transaction Log\n")
             out.write(f"*   **Timestamp:** `{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}`\n")
@@ -265,15 +261,9 @@ def run_agent_loop(user_query: str):
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
                 
-                print(f" -> Routing to: `{function_name}()` | Arguments: {function_args}")
-                
-                # Execute Python function call path matching the target configuration string
                 function_to_call = available_functions[function_name]
                 validated_json_string = function_to_call(**function_args)
                 
-                print(f"    [PYDANTIC SECURE OUTPUT]: {validated_json_string}")
-
-                # Append clean structural log data rows straight to your verification document
                 clean_args = json.dumps(function_args)
                 clean_result = validated_json_string.replace("\n", " ").strip()
                 out.write(f"| `{function_name}` | `{clean_args}` | `{clean_result}` |\n")
@@ -285,32 +275,34 @@ def run_agent_loop(user_query: str):
                     "content": validated_json_string
                 })
 
-        print("[PROCESSING] Forwarding validated data payload back to LPU gateway for response packaging...")
         final_response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.0
         )
         
-        # FIXED: Added [0] index array accessor mapping profile here too
         final_answer = final_response.choices[0].message.content.strip()
         
-        # Append the final assistant response string block to the audit trail log file
         with open(output_md_path, "a", encoding="utf-8") as out:
             out.write(f"\n**Final Natural-Language Agent Output Response:**\n```text\n{final_answer}\n```\n")
             out.write("-" * 80 + "\n")
 
-        print("\n================ FINAL AGENT RESPONSE ================")
-        print(final_answer)
-        print("======================================================\n")
+        return final_answer
     else:
-        print("\n================ FINAL AGENT RESPONSE ================")
-        print(response_message.content.strip())
-        print("======================================================\n")
+        fallback_answer = response_message.content.strip()
+        return fallback_answer
+
+# ----------------------------------------------------------------------
+# ENDPOINT CONNECTOR MODULE ROUTING GATE
+# ----------------------------------------------------------------------
+def generate_answer(user_query: str, context_block: str = "") -> str:
+    """
+    Dynamic grading wrapper alias function.
+    Routes incoming main.py REST gateway network endpoint queries 
+    directly into your live tool-calling chatbot architecture loop.
+    """
+    return run_agent_loop(user_query, context_block)
+
 
 if __name__ == "__main__":
-    # Test Case 1: Triggers get_claim_status and appends verification log matrix
-    run_agent_loop("What is the current status of claim CLM9901?")
-    
-    # Test Case 2: Triggers estimate_out_of_pocket_cost and logs audit trails
-    run_agent_loop("Can you estimate my out of pocket cost for knee surgery under plan P101?")
+    print(run_agent_loop("What is the current status of claim CLM9901?"))

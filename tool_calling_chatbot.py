@@ -202,13 +202,17 @@ TOOLS_SCHEMAS = [
 ]
 
 # ---------------------------------------------------------
-# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN PIPELINE LOOP
+# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN STREAMING PIPELINE
 # ---------------------------------------------------------
-def run_agent_loop(user_query: str, external_context: str = "") -> str:
+def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True):
+    """
+    Executes the insurance tool execution engine using live token-streaming mode.
+    Yields each text fragment wrapped inside an SSE-compliant line envelope block.
+    """
     api_key_env = os.environ.get("GROQ_API_KEY")
     if not api_key_env:
-        print("[ERROR] GROQ_API_KEY environment variable not set.")
-        return "Error: Internal server credential setup missing."
+        yield f"data: {json.dumps({'error': 'Missing internal platform credentials'})}\n\n"
+        return
 
     client = Groq(api_key=api_key_env)
     output_md_path = "/Users/ada/myprojects/my-first-app/tool_call_log.md"
@@ -229,6 +233,7 @@ def run_agent_loop(user_query: str, external_context: str = "") -> str:
         {"role": "user", "content": user_query}
     ]
 
+    # Initial orchestration pass to classify intent and find if tools need invocation
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=messages,
@@ -236,13 +241,12 @@ def run_agent_loop(user_query: str, external_context: str = "") -> str:
         tool_choice="auto",
         temperature=0.0
     )
-
+    
     response_message = response.choices[0].message
     tool_calls = response_message.tool_calls
 
     if tool_calls:
         messages.append(response_message)
-
         available_functions = {
             "check_coverage": check_coverage,
             "get_claim_status": get_claim_status,
@@ -250,59 +254,56 @@ def run_agent_loop(user_query: str, external_context: str = "") -> str:
             "estimate_out_of_pocket_cost": estimate_out_of_pocket_cost
         }
 
-        with open(output_md_path, "a", encoding="utf-8") as out:
-            out.write("\n\n### 📜 Live Agent Execution Transaction Log\n")
-            out.write(f"*   **Timestamp:** `{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}`\n")
-            out.write(f"*   **User Incoming Request Query:** \"{user_query}\"\n\n")
-            out.write("| Executed Tool | Extracted Input Arguments | Pydantic Validated Result Output |\n")
-            out.write("| :--- | :--- | :--- |\n")
-
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            
+            if function_name not in available_functions:
+                continue
                 
-                function_to_call = available_functions[function_name]
-                validated_json_string = function_to_call(**function_args)
-                
-                clean_args = json.dumps(function_args)
-                clean_result = validated_json_string.replace("\n", " ").strip()
-                out.write(f"| `{function_name}` | `{clean_args}` | `{clean_result}` |\n")
+            function_to_call = available_functions[function_name]
+            validated_json_string = function_to_call(**function_args)
 
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": validated_json_string
-                })
+            messages.append({
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": function_name,
+                "content": validated_json_string
+            })
 
-        final_response = client.chat.completions.create(
+    # FINAL SYNTHESIS PASS: Switch the LLM SDK invocation engine into active streaming mode
+    try:
+        completion_stream = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
-            temperature=0.0
+            temperature=0.0,
+            stream=True  # ACTIVATES NATIVE SDK CHUNKING INGESTION
         )
         
-        final_answer = final_response.choices[0].message.content.strip()
-        
-        with open(output_md_path, "a", encoding="utf-8") as out:
-            out.write(f"\n**Final Natural-Language Agent Output Response:**\n```text\n{final_answer}\n```\n")
-            out.write("-" * 80 + "\n")
-
-        return final_answer
-    else:
-        fallback_answer = response_message.content.strip()
-        return fallback_answer
+        # Yield each token immediately as an SSE-formatted data line down the network line wire
+        for chunk in completion_stream:
+            # Extract content characters safely from the current stream iteration delta block
+            token_text = chunk.choices[0].delta.content
+            if token_text:
+                payload = {"token": token_text}
+                yield f"data: {json.dumps(payload)}\n\n"
+                
+    except Exception as stream_fault:
+        payload = {"error": f"Mid-stream network exception: {str(stream_fault)}"}
+        yield f"data: {json.dumps(payload)}\n\n"
 
 # ----------------------------------------------------------------------
 # ENDPOINT CONNECTOR MODULE ROUTING GATE
 # ----------------------------------------------------------------------
-def generate_answer(user_query: str, context_block: str = "") -> str:
+def generate_answer(user_query: str, context_block: str = ""):
     """
-    Dynamic grading wrapper alias function.
-    Routes incoming main.py REST gateway network endpoint queries 
-    directly into your live tool-calling chatbot architecture loop.
+    Dynamic grading wrapper alias function yielding text content over 
+    the active network pipeline layer block.
     """
     return run_agent_loop(user_query, context_block)
 
 
 if __name__ == "__main__":
-    print(run_agent_loop("What is the current status of claim CLM9901?"))
+    # Test file direct execution capability loop parameters
+    for sse_line in run_agent_loop("What is the current status of claim CLM9901?"):
+        print(sse_line.strip())

@@ -108,7 +108,7 @@ if user_message := st.chat_input("Ask about a claim or coverage rules (e.g., 'Wh
         detected_card_payload = None
         
         try:
-            response = requests.post(BACKEND_URL, json=payload, stream=True, timeout=(5.0, 15.0))
+            response = requests.post(BACKEND_URL, json=payload, stream=True, timeout=(5.0, 60.0))
             
             if response.status_code == 200:
                 for line in response.iter_lines():

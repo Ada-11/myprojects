@@ -1,10 +1,12 @@
 import os
 import sys
 import json
+import sqlite3
 from typing import Optional, List
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, ValidationError
 from groq import Groq
+import tiktoken
 
 # ---------------------------------------------------------
 # 1. PYDANTIC OUTPUT DATA SCHEMAS FOR STRICT VALIDATION
@@ -201,49 +203,185 @@ TOOLS_SCHEMAS = [
     }
 ]
 
-# ---------------------------------------------------------
-# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN STREAMING PIPELINE
-# ---------------------------------------------------------
-def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True):
-    """
-    Executes the insurance tool execution engine using live token-streaming mode.
-    Yields each text fragment wrapped inside an SSE-compliant line envelope block.
-    """
+# ----------------------------------------------------------------------
+# 4.5 UNIFIED AUTOMATED MEMORY COMPRESSION & TOKEN COUNTING UTILITIES
+# ----------------------------------------------------------------------
+def count_tokens_in_history(messages_list: list, model_name: str = "gpt-3.5-turbo") -> int:
+    """Calculates exact token weight footprint of a message array stack."""
+    try:
+        encoding_engine = tiktoken.encoding_for_model(model_name)
+    except KeyError:
+        encoding_engine = tiktoken.get_encoding("cl100k_base")
+        
+    total_tokens = 0
+    for message in messages_list:
+        total_tokens += 4  
+        total_tokens += len(encoding_engine.encode(message.get("content", "")))
+        total_tokens += len(encoding_engine.encode(message.get("role", "")))
+    total_tokens += 2  
+    return total_tokens
+
+def prune_and_summarize_session_history(session_id: str, db_path: str, groq_client: Groq):
+    """Measures token metrics and condenses oldest 50% of history when threshold is breached."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT id, role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
+        )
+        all_rows = cursor.fetchall()
+        
+        formatted_messages = [{"role": r, "content": c} for _, r, c in all_rows]
+        token_count_before = count_tokens_in_history(formatted_messages)
+        
+        print(f"\n[TOKEN TELEMETRY] Session: {session_id} | Pre-Check Token Weight: {token_count_before} tokens")
+        
+        # Threshold flag check boundary (~2000 tokens)
+        if token_count_before <= 2000:
+            print(f"[TOKEN TELEMETRY] Status: SAFE ({token_count_before}/2000 tokens). Skipping pruning gate.")
+            conn.close()
+            return
+            
+        print(f"⚠️ [MEMORY CRITICAL] Session {session_id} at {token_count_before} tokens. Compressing thread window...")
+        
+        split_index = len(all_rows) // 2
+        rows_to_summarize = all_rows[:split_index]
+        
+        digest_text = ""
+        for _, role, content in rows_to_summarize:
+            digest_text += f"{role.upper()}: {content}\n"
+            
+        summary_prompt = (
+            "You are an internal system log compression daemon engine.\n"
+            "Summarize the conversation transcript below into a single, highly dense, concise paragraph.\n"
+            "Ensure you capture all specified alphanumeric data vectors accurately.\n"
+            "Return ONLY the summary paragraph text with no extra remarks.\n\n"
+            f"Transcript Log to Compress:\n{digest_text}"
+        )
+        
+        summary_response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": summary_prompt}],
+            temperature=0.0
+        )
+        condensed_summary_string = summary_response.choices[0].message.content.strip()
+        
+        row_ids_to_delete = [row for row in rows_to_summarize]
+        cursor.execute(
+            f"DELETE FROM conversations WHERE id IN ({','.join(['?'] * len(row_ids_to_delete))})",
+            row_ids_to_delete
+        )
+        
+        cursor.execute(
+            "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (
+                session_id, 
+                "system", 
+                f"[SYSTEM CONVERSATION SUMMARY OF OLDER TURNS]: {condensed_summary_string}", 
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+        )
+        conn.commit()
+        
+        cursor.execute(
+            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
+        )
+        updated_rows = cursor.fetchall()
+        conn.close()
+        
+        updated_messages = [{"role": r, "content": c} for r, c in updated_rows]
+        token_count_after = count_tokens_in_history(updated_messages)
+        
+        print(f"✅ [MEMORY OPTIMIZED] Summarization complete for Session: {session_id}")
+        print(f"[TOKEN TELEMETRY] Post-Compression Token Weight: {token_count_after} tokens (Saved: {token_count_before - token_count_after} tokens)\n")
+        
+    except Exception as e:
+        print(f"[WARN] Memory compression thread experienced an exception: {str(e)}")
+
+# ----------------------------------------------------------------------
+# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN PIPELINE WITH HISTORY INJECTION
+# ----------------------------------------------------------------------
+def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True, session_id: str = "DEFAULT-SESS"):
+    """Executes agent loop using token-streaming and pulls last 10 messages from absolute SQLite path."""
     api_key_env = os.environ.get("GROQ_API_KEY")
     if not api_key_env:
         yield f"data: {json.dumps({'error': 'Missing internal platform credentials'})}\n\n"
         return
 
     client = Groq(api_key=api_key_env)
-    output_md_path = "/Users/ada/myprojects/my-first-app/tool_call_log.md"
+    
+    # FORCED UNIFIED ABSOLUTE DB DATABASE PATH LAYER
+    db_path = "/Users/ada/myprojects/my-first-app/coverage-chatbot-api/coverage.db"
+
+    # Trigger single pruning evaluation gate check pass before constructing system strings
+    prune_and_summarize_session_history(session_id, db_path, client)
+
+    historical_turns = []
+    remembered_plan_id = "Not Specified Yet"
+    
+    try:
+        if os.path.exists(db_path):
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
+                (session_id,)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            
+            for role, content in rows:
+                historical_turns.append({"role": role, "content": content})
+                content_upper = content.upper()
+                if "P101" in content_upper or "GOLD PPO" in content_upper:
+                    remembered_plan_id = "P101 (Gold PPO)"
+                elif "P102" in content_upper or "SILVER HMO" in content_upper:
+                    remembered_plan_id = "P102 (Silver HMO)"
+                elif "P103" in content_upper or "BRONZE HMO" in content_upper:
+                    remembered_plan_id = "P103 (Bronze HMO)"
+    except Exception as db_err:
+        print(f"[WARN] Failed to pull context arrays from SQLite tracking ledger: {str(db_err)}")
+
+    sliding_window_history = historical_turns[-10:] if len(historical_turns) > 10 else historical_turns
 
     system_prompt = (
         "You are an advanced health insurance navigation assistant combining structural compliance limits with an accessible, professional tone.\n"
         "1. ACCURATE AND EMPATHETIC BALANCE: State all tool-returned metrics, deductibles, and coverage statuses with literal precision.\n"
         "2. MEDICAL DEFLECTION GUARDRAIL: If the user mentions health symptoms, state clearly that you cannot evaluate conditions and direct them to their doctor.\n"
         "3. TERMINOLOGY GUARDRAIL: Always define 'deductible' in plain language on first use.\n"
-        "4. STANDARD CLOSING DISCLAIMER: Conclude with this exact standalone paragraph: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'"
+        "4. STANDARD CLOSING DISCLAIMER: Conclude with this exact standalone paragraph: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'\n\n"
+        "----------------------------------------------------------------------\n"
+        "⚙️ TRACKED MEMBER SESSION PARAMETERS (PLAN-MEMORY STORAGE LAYER):\n"
+        f"*   Remembered Insurance Policy Plan ID for Session: {remembered_plan_id}\n"
+        "----------------------------------------------------------------------\n"
     )
 
     if external_context:
         system_prompt += f"\n\nRetrieved RAG Context Layer Material:\n{external_context}"
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_query}
-    ]
-
-    # Initial orchestration pass to classify intent and find if tools need invocation
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=messages,
-        tools=TOOLS_SCHEMAS,
-        tool_choice="auto",
-        temperature=0.0
-    )
+    messages = [{"role": "system", "content": system_prompt}]
     
-    response_message = response.choices[0].message
-    tool_calls = response_message.tool_calls
+    for turn in sliding_window_history:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+        
+    messages.append({"role": "user", "content": user_query})
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            tools=TOOLS_SCHEMAS,
+            tool_choice="auto",
+            temperature=0.0
+        )
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+    except Exception as api_err:
+        yield f"data: {json.dumps({'error': f'Inference gateway connection loss: {str(api_err)}'})}\n\n"
+        return
 
     if tool_calls:
         messages.append(response_message)
@@ -271,23 +409,19 @@ def run_agent_loop(user_query: str, external_context: str = "", stream: bool = T
                 "content": validated_json_string
             })
 
-    # FINAL SYNTHESIS PASS: Switch the LLM SDK invocation engine into active streaming mode
     try:
         completion_stream = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.0,
-            stream=True  # ACTIVATES NATIVE SDK CHUNKING INGESTION
+            stream=True
         )
         
-        # Yield each token immediately as an SSE-formatted data line down the network line wire
         for chunk in completion_stream:
-            # Extract content characters safely from the current stream iteration delta block
             token_text = chunk.choices[0].delta.content
             if token_text:
                 payload = {"token": token_text}
                 yield f"data: {json.dumps(payload)}\n\n"
-                
     except Exception as stream_fault:
         payload = {"error": f"Mid-stream network exception: {str(stream_fault)}"}
         yield f"data: {json.dumps(payload)}\n\n"
@@ -295,15 +429,10 @@ def run_agent_loop(user_query: str, external_context: str = "", stream: bool = T
 # ----------------------------------------------------------------------
 # ENDPOINT CONNECTOR MODULE ROUTING GATE
 # ----------------------------------------------------------------------
-def generate_answer(user_query: str, context_block: str = ""):
-    """
-    Dynamic grading wrapper alias function yielding text content over 
-    the active network pipeline layer block.
-    """
-    return run_agent_loop(user_query, context_block)
+def generate_answer(user_query: str, context_block: str = "", session_id: str = "DEFAULT-SESS"):
+    return run_agent_loop(user_query, context_block, stream=True, session_id=session_id)
 
 
 if __name__ == "__main__":
-    # Test file direct execution capability loop parameters
-    for sse_line in run_agent_loop("What is the current status of claim CLM9901?"):
+    for sse_line in run_agent_loop("What is my deductible?", session_id="TEST-SESS-001"):
         print(sse_line.strip())

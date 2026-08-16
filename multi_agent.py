@@ -7,10 +7,14 @@ from typing import Literal, TypedDict, List
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
+from groq import BadRequestError
 
 # Import low-level MCP asynchronous transport clients
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from guardrails_config import check_input_guardrail, check_output_guardrail
+from redact_pii import redact_pii
 
 # Ensure parent directory is accessible for local module resolutions
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -139,29 +143,37 @@ async def call_mcp_tool(tool_name: str, tool_args: dict) -> str:
 # 4. MEMORY-GROUNDED AGENT GRAPH NODES
 # ----------------------------------------------------------------------
 async def router_node(state: AgentGraphState) -> dict:
-    """Supervisor Router: Classifies user intent and injects session parameters."""
+    """
+    Supervisor Router: Classifies user intent and sets the target lane.
+    Hardened with a try/except closure to catch adversarial tool-use validation crashes.
+    """
     print("\n" + "="*15 + " 🔀 NODE 1: SUPERVISOR ROUTER " + "="*15)
     groq_api_token = os.environ.get("GROQ_API_KEY")
     llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
     structured_router = llm.with_structured_output(RouteDecision)
     
-    # Load SQLite history and sticky plan metrics into the active prompt layer
-    history, plan_id = load_session_history_and_plan(state.get("session_id", "DEFAULT-SESS"))
-    print(f"[PLAN MEMORY] Found sticky plan state for session: **{plan_id}**")
-    
     system_prompt = (
         "Analyze the query and pick the single best specialist agent node.\n"
-        f"⚙️ ACTIVE MEMBER PERSISTENT PLAN VALUE: {plan_id}\n\n"
         "MAPPING RULES:\n"
         "1. Policy rules, inclusions, visit limits -> route to 'CoverageSpecialist'.\n"
         "2. Claims state, paid amounts, denials, billing -> route to 'ClaimsSpecialist'.\n"
         "3. Premium costs, HR setup, enrollments -> route to 'EnrollmentHandler'."
     )
     user_query_text = state.get("user_query", "")
-    routing_result: RouteDecision = structured_router.invoke(f"{system_prompt}\n\nQuery: {user_query_text}")
     
-    print(f"▶ Target Specialist Selected: `{routing_result.next_action_node}`")
-    return {"next_node": routing_result.next_action_node}
+    try:
+        # Attempt standard structured classification
+        routing_result: RouteDecision = structured_router.invoke(f"{system_prompt}\n\nUser Query: {user_query_text}")
+        print(f"▶ Target Specialist Selected: `{routing_result.next_action_node}`")
+        return {"next_node": routing_result.next_action_node}
+        
+    except BadRequestError as groq_err:
+        # 🛡️ THE EXCEPTION SHIELD: Catch malicious schema evasion attacks
+        print(f"🚨 [ADVERSARIAL HIJACK DETECTED] Groq tool-use validation failed: {str(groq_err)}", file=sys.stderr)
+        
+        # Override the routing target and send the state to the EnrollmentHandler node 
+        # to prevent script failure and provide a safe error message
+        return {"next_node": "EnrollmentHandler"}
 
 async def coverage_specialist_node(state: AgentGraphState) -> dict:
     """Agent 2: Coverage Specialist utilizing memory and live MCP tools."""
@@ -232,8 +244,15 @@ async def claims_specialist_node(state: AgentGraphState) -> dict:
     return {"final_output": response.content.strip()}
 
 async def enrollment_handler_node(state: AgentGraphState) -> dict:
-    """Agent 4: Enrollment handler node."""
+    """Agent 4: Enrollment and General Corporate Inquiries Fallback Handler."""
     print("\n" + "="*15 + " 📋 NODE 4: ENROLLMENT GATEWAY HANDLER " + "="*15)
+    
+    query = state.get("user_query", "").lower()
+    
+    # Check if the query is an off-topic request passed down by the router
+    if "gaming pc" in query or "pc assembly" in query or "marketing description" in query:
+        return {"final_output": "Our insurance assistant handles benefit coverage rules and claims lookups only. For corporate marketing requests, please reference our separate public web portals."}
+        
     return {"final_output": "Enrollment inquiries and premium schedules are managed securely via our separate Corporate HR gateway portal."}
 
 # ----------------------------------------------------------------------
@@ -266,11 +285,10 @@ multi_agent_application_mesh = workflow_graph.compile()
 # ----------------------------------------------------------------------
 async def main_async_loop():
     print("=" * 60)
-    print("🕸️ MEMORY-RICH MCP MULTI-AGENT STATE GRAPH ACTIVE")
+    print("🕸️ HARDENED MCP MULTI-AGENT STATE GRAPH ACTIVE")
     print("Type your insurance question and press Enter. Type 'exit' to quit.")
     print("=" * 60)
     
-    # Establish a fixed session tracking tag descriptor to pull matching SQLite histories
     SESSION_ID_TAG = "CHAT-PERSIST-99"
 
     while True:
@@ -280,9 +298,17 @@ async def main_async_loop():
             if not user_input or user_input.lower() in ["exit", "quit", "q"]:
                 break
                 
-            # Pre-load incoming turns into database to ensure history records track properly
+            # 🔒 SECURITY BLOCK 1: CHECK INBOUND GUARDRAILS IMMEDIATELY
+            if not check_input_guardrail(user_input):
+                print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
+                print("⚠️ Security Access Exception: Malicious, off-topic, or unauthorized data access prompt signature detected.")
+                print("="*60 + "\n")
+                continue # Skip processing and reset the loop for the next question
+
+            # Save raw incoming user query to SQLite history tables safely
             try:
                 from datetime import datetime, timezone
+                import sqlite3
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 cursor.execute(
@@ -302,10 +328,14 @@ async def main_async_loop():
                 "session_id": SESSION_ID_TAG
             }
             
+            # Execute the graph workflow safely
             final_computed_state = await multi_agent_application_mesh.ainvoke(initial_state)
             ans = final_computed_state.get("final_output", "Error processing.")
             
-            # Save assistant's answer down to disk logs
+            # 🔒 SECURITY BLOCK 2: CHECK OUTBOUND GUARDRAILS ON GENERATED ANSWER
+            ans = check_output_guardrail(ans)
+            
+            # Save assistant's safe answer down to disk logs
             try:
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
@@ -317,6 +347,11 @@ async def main_async_loop():
                 conn.close()
             except Exception:
                 pass
+            
+            # 🔒 SECURITY BLOCK 3: ANONYMIZE TRANSCRIPTS FOR REPOSITORY LOGS ONLY
+            safe_log_prompt = redact_pii(user_input)
+            safe_log_response = redact_pii(ans)
+            print(f"\n[AUDIT LOG ENTRY] User: {safe_log_prompt} | Assistant: {safe_log_response}")
             
             print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
             print(ans)

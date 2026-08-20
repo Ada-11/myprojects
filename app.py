@@ -8,7 +8,7 @@ import streamlit as st
 # Import the structural Pydantic card schemas from your project module
 from response_cards import ClaimStatusCard, CoverageSummaryCard
 
-BACKEND_URL = "http://localhost:8000/chat"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/chat")
 
 st.set_page_config(page_title="Member Dashboard", layout="wide")
 

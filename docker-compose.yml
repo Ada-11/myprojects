@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chatbot_backend
+    # Load API keys from .env file
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount ChromaDB local data
+      - ./chroma_db:/app/chroma_db
+      # Mount SQLite history database
+      - ./coverage-chatbot-api/coverage.db:/app/coverage-chatbot-api/coverage.db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s    # IMPORTANT: Don't start counting failures for the first 60 seconds
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: chatbot_frontend
+    env_file:
+      - .env
+    ports:
+      - "8501:8501"
+    environment:
+      # Direct the frontend to communicate with the backend container
+      - BACKEND_URL=http://backend:8000/chat
+    depends_on:
+      backend:
+        condition: service_healthy

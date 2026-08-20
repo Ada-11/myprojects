@@ -33,6 +33,11 @@ import hashlib
 
 app = FastAPI()
 
+@app.get("/health")
+
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 # ---------------------------------------------------------
 # 1. DATABASE INITIALIZATION: SQLITE STORAGE ENGINE
 # ---------------------------------------------------------

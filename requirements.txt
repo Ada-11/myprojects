@@ -1,0 +1,13 @@
+sentence-transformers
+fastapi
+uvicorn
+groq
+chromadb
+langchain-groq
+langgraph
+pydantic
+tiktoken
+requests
+pandas
+pytesseract
+pypdf

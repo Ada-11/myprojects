@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: chatbot-backend:v2
+        image: chatbot-backend:v6
         imagePullPolicy: Never # Critical: Tells K8s to look locally
         ports:
         - containerPort: 8000

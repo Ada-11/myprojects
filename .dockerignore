@@ -1,0 +1,13 @@
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.git
+.gitignore
+.vscode
+.DS_Store
+chroma_db
+coverage-chatbot-api/coverage.db

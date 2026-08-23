@@ -1,53 +1,69 @@
-"""Simple script with a helper to fetch JSON from a URL."""
-
-
+"""
+Main FastAPI Gateway for Agentic Health Insurance Chatbot.
+Handles SSE Streaming, Rate Limiting, SHA-256 Caching, 
+Observability (Langfuse v4), and SQLite Persistence.
+"""
 
 import sys
 import os
 import time
-from typing import Any
 import json
 import sqlite3
+import hashlib
 import urllib.request
 import urllib.error
+import asyncio
 from datetime import datetime, timezone
-
-# Ensure parent directory is accessible for local module resolution
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from typing import Any, List, Optional, Literal, TypedDict
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
+# --- INITIALIZE ENVIRONMENT & OBSERVABILITY ---
+load_dotenv()
+from langfuse import Langfuse
+# Initialize the manual client for SDK v4 compatibility
+# This ensures stability on Mac and within Kubernetes containers
+langfuse = Langfuse()
+
+# --- PROJECT MODULE IMPORTS ---
+# These must exist in your root directory or PYTHONPATH
 from retrieval_engine import retrieve
-from tool_calling_chatbot import run_agent_loop
-
 from redact_pii import redact_pii
 from guardrails_config import check_input_guardrail, check_output_guardrail
-
 from token_utils import count_tokens
-from collections import defaultdict
-import time
-import hashlib
 
-
-app = FastAPI()
-
-@app.get("/health")
-
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+app = FastAPI(
+    title="Insurance Agent API",
+    description="Production-grade API for health insurance policy navigation."
+)
 
 # ---------------------------------------------------------
 # 1. DATABASE INITIALIZATION: SQLITE STORAGE ENGINE
 # ---------------------------------------------------------
-DB_PATH = "coverage.db"
+# Configuration: Absolute path for Kubernetes volume mounts
+DB_PATH = "/app/coverage-chatbot-api/coverage.db"
+
+# Fallback for local Mac development if the /app directory does not exist
+if not os.path.exists("/app"):
+    DB_PATH = "coverage-chatbot-api/coverage.db"
 
 def init_db():
-    """Initializes the database schema for structural conversation history log tracking."""
+    """
+    Initializes the database schema for structural conversation history 
+    and detailed token/cost usage tracking.
+    """
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Create conversations table with core required columns
+    
+    # Table for long-term chat history and session persistence
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,20 +73,31 @@ def init_db():
             timestamp TEXT NOT NULL
         )
     """)
+    
+    # Table for observability analytics and financial auditing
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost REAL NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
-# Run table initialization on server initialization bootup
+# Provision database on server initialization
 init_db()
 
+# ---------------------------------------------------------
+# 2. REQUEST MODELS, RATE LIMITING & CACHING
+# ---------------------------------------------------------
 class ChatRequest(BaseModel):
     session_id: str
     member_id: str
     message: str
-
-
-import time
-from collections import defaultdict
 
 # Global rate limiting thresholds (Max 5 requests per 60 seconds per session)
 RATE_LIMIT_CEILING = 5
@@ -103,8 +130,6 @@ def is_eligible_for_caching(question: str) -> bool:
     Explicitly blocks member-specific questions containing claim or tracking identifiers.
     """
     clean_q = question.lower().strip()
-    
-    # Identify high-risk personal search patterns
     restricted_identifiers = [
         "clm", "claim", "member id", "my policy", "my balance", 
         "status of", "p10", "p11", "em9", "john doe"
@@ -112,174 +137,164 @@ def is_eligible_for_caching(question: str) -> bool:
     
     for identifier in restricted_identifiers:
         if identifier in clean_q:
-            print(f"🔒 [CACHE BYPASS] Query contains member-specific identifier '{identifier}'. Disabling cache.")
             return False
             
     return True
 
+def fetch_json(url: str, timeout: int = 10) -> Any:
+    """Standard helper to fetch JSON from external URLs (e.g., for RAG context)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "python-urllib/3"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset(failobj="utf-8")
+            data = resp.read().decode(charset)
+            return json.loads(data)
+    except Exception as e:
+        print(f"[FETCH ERROR] {e}")
+        return None
+
 # ---------------------------------------------------------
-# 2. CARDS + STREAMING PIPELINE ENDPOINT (POST /chat)
+# 3. API ENDPOINTS (Streaming + Observability)
 # ---------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    """Standard RFC-compliant health check for Kubernetes liveness/readiness probes."""
+    return {
+        "status": "healthy", 
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": os.path.exists(DB_PATH)
+    }
+
 @app.post("/chat")
 async def handle_chat_endpoint(payload: ChatRequest):
     """
-    POST /chat endpoint. Hardened against crashes, protected by security guardrails,
-    rate-limited per session, optimized with tiktoken tracking, and accelerated with a
-    privacy-aware exact-match general query cache.
+    Main Chat Interface. 
+    Returns a StreamingResponse (SSE) compatible with the Streamlit UI.
     """
-    start_time = time.perf_counter()
-    user_raw_input = payload.message
     
-    # 🔒 RATE LIMIT GATEWAY: Intercept spam attempts at the absolute front door
-    if is_rate_limited(payload.session_id):
-        print(f"⚠️ [RATE LIMIT TRIGGER] Denied request stream block for session: {payload.session_id}")
-        return {
-            "response": "⚠️ Too many requests. You have exceeded our security standard of 5 requests per minute. Please pause and try your question again in a few moments."
-        }
-    
-    # 🧮 STEP 1: CALCULATE THE RAW INBOUND PROMPT TOKEN SIZE IMMEDIATELY
-    prompt_token_count = count_tokens(user_raw_input)
-    
-    # 🔒 SAFE INTERCEPTION GATE: Returns a clean string if input fails validation
-    if not check_input_guardrail(user_raw_input):
-        print("🛡️ [SECURITY INTERCEPT] Inbound block executed. Preventing loop run.")
-        print(f"[METRIC LOG] Intercepted Prompt Token Size: {prompt_token_count}")
-        return {"response": "⚠️ Security Access Exception: Malicious, off-topic, or unapproved prompt signature detected."}
+    async def event_generator():
+        # Start the manual Langfuse Trace for v4 compatibility
+        with langfuse.start_as_current_observation(
+            name="chat_request",
+            metadata={
+                "user_id": payload.member_id,
+                "session_id": payload.session_id,
+                "deployment": "k8s-minikube",
+                "cache_enabled": True
+            }
+        ) as trace:
+            
+            user_raw_input = payload.message
+            
+            # 🔒 RATE LIMIT GATEWAY: Intercept spam attempts
+            if is_rate_limited(payload.session_id):
+                trace.update(status_message="Rate Limit Triggered")
+                yield f"data: {json.dumps({'error': 'Rate limit exceeded. Please wait 60 seconds.'})}\n\n"
+                return
+            
+            # 🔒 SECURITY BLOCK: Check inbound guardrails for injection/PII
+            if not check_input_guardrail(user_raw_input):
+                trace.update(status_message="Inbound Block", output="Security Access Exception")
+                yield f"data: {json.dumps({'error': 'Security Access Exception: Prompt signature blocked.'})}\n\n"
+                return
 
-    # 🚀 CACHE READ HIT CLOSURE: Evaluate exact-match general coverage shortcuts
-    q_hash = get_question_hash(user_raw_input)
-    cache_eligible = is_eligible_for_caching(user_raw_input)
-    
-    if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
-        cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
-        print(f"⚡ [CACHE HIT] Serving optimized, zero-token response for: '{user_raw_input}'")
-        
-        # Log zero tokens for the outbound trace logging records
-        print(f"[AUDIT TRACE LOG] Ingress: {redact_pii(user_raw_input)} | Egress (CACHED): {redact_pii(cached_reply)}")
-        return {"response": cached_reply}
-    
-    # Run database index lookups using raw string variables (Cache Miss Path)
-    retrieval_payload = retrieve(user_raw_input)
-    context_block = retrieval_payload.get("context_block", "")
-    
-    # Extract chunk IDs from metadata
-    chunk_ids = retrieval_payload.get("chunk_ids", [])
-    if not chunk_ids and "source_nodes" in retrieval_payload:
-        chunk_ids = [node.get("id") or node.get("node_id") for node in retrieval_payload["source_nodes"]]
-    if not chunk_ids:
-        chunk_ids = ["CHK-E9A3", "CHK-4B1C"]
-        
-    # Persist raw message parameters into SQLite history tables safely
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (payload.session_id, "user", user_raw_input, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as db_err:
-        print(f"[DB ERROR] Failed to record transaction: {str(db_err)}")
+            # 🚀 CACHE READ HIT: Hashed exact match lookup
+            q_hash = get_question_hash(user_raw_input)
+            cache_eligible = is_eligible_for_caching(user_raw_input)
+            
+            if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
+                cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
+                trace.update(output=cached_reply, metadata={"cache": "hit"})
+                yield f"data: {json.dumps({'token': cached_reply})}\n\n"
+                return
 
-    # ----------------------------------------------------------------------
-    # 🕸️ CORE COGNITION GENERATION LOOP BLOCK: CONNECT THE REAL AGENT GRAPH
-    # ----------------------------------------------------------------------
-    try:
-        # Import your actual live agent app instance from your multi-agent module
-        from multi_agent import multi_agent_application_mesh
-        
-        # Package your active request inputs straight into your formal state dict
-        initial_graph_state = {
-            "user_query": user_raw_input,
-            "messages": [],
-            "next_node": "",
-            "final_output": "",
-            "session_id": payload.session_id
-        }
-        
-        print(f"🕸️ [LIVE GRAPH INVOKE] Running multi-agent application mesh flow dynamically...")
-        
-        # Invoke your existing agent mesh over async threads natively
-        computed_final_state = await multi_agent_application_mesh.ainvoke(initial_graph_state)
-        
-        # Extract the real ground-truth generated text value into your output channel
-        assistant_generated_reply = computed_final_state.get("final_output", "Error: No final output computed by graph.")
-        
-    except Exception as err:
-        print(f"⚠️ [GRAPH ERROR] Failed running live multi-agent execution pipeline: {str(err)}")
-        assistant_generated_reply = f"System lookup failure: Multi-agent compilation interrupted. Error: {str(err)}"
-        
-    # 🔒 SECURITY STEP 2: RUN THE GENERATION THROUGH OUTBOUND GUARDRAILS
-    final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
-    
-    # ⚡ CACHE WRITE PATH: Store the response safely if the question is generic coverage
-    if cache_eligible:
-        GENERAL_RESPONSE_CACHE[q_hash] = final_sanitized_ui_response
-        print(f"💾 [CACHE WRITE] Saved general coverage response hash key entry down to memory index.")
-    
-    # 🧮 STEP 3: CALCULATE THE SAFELY SANITIZED OUTBOUND COMPLETION TOKEN SIZE
-    completion_token_count = count_tokens(final_sanitized_ui_response)
-    
-    # 📊 STEP 4: LOG THE COMBINED TRANSACTION PERFORMANCE AND PRICING METRICS
-    total_turn_tokens = prompt_token_count + completion_token_count
-    input_rate_per_token = 0.05 / 1_000_000
-    output_rate_per_token = 0.08 / 1_000_000
-    estimated_cost = (prompt_token_count * input_rate_per_token) + (completion_token_count * output_rate_per_token)
-    current_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    # PERSISTENT METRIC LOGGING TRANSACTION BLOCK
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost)
-            VALUES (?, ?, ?, ?, ?)
-        """, (payload.session_id, current_timestamp, prompt_token_count, completion_token_count, estimated_cost))
-        conn.commit()
-        conn.close()
-    except Exception as db_metric_err:
-        print(f"⚠️ [METRIC LOG ERROR] Failed to record token analytics to SQLite: {str(db_metric_err)}")
-    
-    print(f"\n" + "="*15 + " 📊 REAL-TIME TURN TOKEN METRICS " + "="*15)
-    print(f"▶ Inbound Prompt footprint:      {prompt_token_count} tokens")
-    print(f"▶ Outbound Completion footprint:  {completion_token_count} tokens")
-    print(f"▶ Total Single-Turn Footprint:   {total_turn_tokens} tokens")
-    print(f"▶ Financial Transaction Expense: ${estimated_cost:.8f}")
-    print("="*60 + "\n")
-    
-    # Anonymize analytical text fields for secure trace log storage dumps (Scenario 1)
-    safe_log_prompt = redact_pii(user_raw_input)
-    safe_log_response = redact_pii(final_sanitized_ui_response)
-    print(f"[AUDIT TRACE LOG] Ingress: {safe_log_prompt} | Egress: {safe_log_response}")
-    
-    return {"response": final_sanitized_ui_response}
-    # ----------------------------------------------------------------------
-    # GENERATION EXECUTION STEP
-    # ----------------------------------------------------------------------
-    # Execute your agent graph mesh or generation engine using the input string
-    try:
-        # Replace this string placeholder with your actual live generation engine execution variable!
-        assistant_generated_reply = "Based on your chart details, you should take aspirin for that symptom."
-    except Exception as err:
-        assistant_generated_reply = f"System lookup failure: {str(err)}"
-    
-    # 🔒 FIXED OUTBOUND PERIMETER INTERACTION:
-    # Forces the newly generated answer string through your output filters before it reaches the UI
-    final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
-    
-    # Anonymize analytical data records for trace log storage dumps (Scenario 1)
-    safe_log_prompt = redact_pii(user_raw_input)
-    safe_log_response = redact_pii(final_sanitized_ui_response)
-    print(f"[AUDIT TRACE LOG] Ingress: {safe_log_prompt} | Egress: {safe_log_response}")
-    
-    # Return the clean, safely verified response dictionary back down the route
-    return {"response": final_sanitized_ui_response}
+            # 🕸️ AGENT GRAPH EXECUTION SPAN
+            with langfuse.start_as_current_observation(name="agent_graph_execution") as span:
+                try:
+                    # Dynamic import to ensure current graph state
+                    from multi_agent import multi_agent_application_mesh
+                    
+                    initial_state = {
+                        "user_query": user_raw_input,
+                        "session_id": payload.session_id,
+                        "messages": [],
+                        "next_node": "",
+                        "final_output": ""
+                    }
+                    
+                    # Execute the asynchronous graph
+                    computed_final_state = await multi_agent_application_mesh.ainvoke(initial_state)
+                    assistant_generated_reply = computed_final_state.get("final_output", "No response generated.")
+                    
+                    span.update(output=assistant_generated_reply)
+                    
+                except Exception as err:
+                    assistant_generated_reply = f"System lookup failure: {str(err)}"
+                    span.update(level="ERROR", status_message=str(err))
+
+            # 🔒 SECURITY BLOCK: Run outbound guardrails (Medical Deflection)
+            final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
+            
+            # ⚡ CACHE WRITE: Store successful general inquiries
+            if cache_eligible:
+                GENERAL_RESPONSE_CACHE[q_hash] = final_sanitized_ui_response
+            
+            # 🧮 TOKEN TELEMETRY
+            prompt_token_count = count_tokens(user_raw_input)
+            completion_token_count = count_tokens(final_sanitized_ui_response)
+            
+            # Update Langfuse with exact token usage
+            trace.update(
+                output=final_sanitized_ui_response,
+                usage={
+                    "input": prompt_token_count, 
+                    "output": completion_token_count,
+                    "total": prompt_token_count + completion_token_count,
+                    "unit": "TOKENS"
+                }
+            )
+
+            # 📊 PERSISTENT TRANSACTION LOGGING
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                # Save conversation history
+                cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                               (payload.session_id, "user", user_raw_input, now_ts))
+                cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                               (payload.session_id, "assistant", final_sanitized_ui_response, now_ts))
+                
+                # Financial tracking calculation
+                # Rates: $0.05 per 1M Input / $0.08 per 1M Output
+                estimated_cost = (prompt_token_count * (0.05/1000000)) + (completion_token_count * (0.08/1000000))
+                cursor.execute("""
+                    INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (payload.session_id, now_ts, prompt_token_count, completion_token_count, estimated_cost))
+                
+                conn.commit()
+                conn.close()
+            except Exception as db_err:
+                print(f"⚠️ [DATABASE ERROR] Failed to record transaction: {db_err}")
+
+            # Ensure all traces are sent to cloud before closure
+            langfuse.flush()
+
+            # 📺 YIELD TO UI: SSE SSE format for Streamlit consumption
+            yield f"data: {json.dumps({'token': final_sanitized_ui_response})}\n\n"
+            
+            # Clean terminal audit entry
+            print(f"[AUDIT] Ingress: {redact_pii(user_raw_input)} | Egress: {redact_pii(final_sanitized_ui_response)}")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/history/{session_id}")
 def get_session_history(session_id: str):
-    """Fetches long-term records directly out of the SQLite conversations table database matrix."""
+    """Retrieves records out of the SQLite conversations table for UI restoration."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=30.0)
         cursor = conn.cursor()
@@ -299,18 +314,9 @@ def get_session_history(session_id: str):
         raise HTTPException(status_code=500, detail=f"Database retrieval breakdown: {str(e)}")
 
 
-def fetch_json(url: str, timeout: int = 10) -> Any:
-    """Fetch the given URL and return the parsed JSON."""
-    req = urllib.request.Request(url, headers={"User-Agent": "python-urllib/3"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset(failobj="utf-8")
-        data = resp.read().decode(charset)
-        return json.loads(data)
-
-
 if __name__ == "__main__":
-    try:
-        sample = fetch_json("https://typicode.com")
-        print("Fetched JSON:", sample)
-    except Exception as e:
-        print("Error fetching JSON:", e)
+    import uvicorn
+    # Start production gateway
+    print("🚀 PRODUCTION OBSERVABILITY GATEWAY STARTING ON http://0.0.0.0:8000")
+    print(f"📍 TARGET DATABASE: {DB_PATH}")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -35,9 +35,17 @@ def check_output_guardrail(response_text: str) -> str:
     clean_response = sanitized.lower()
     
     # Catch clinical advice steering keywords
+    # FIXED: Removed "medical advice" from this list to prevent self-triggering 
+    # when the model includes its mandatory disclaimer.
     medical_advice_indicators = [
-        "you should take", "your condition is", "diagnose", "treat this symptom",
-        "take this medication", "suggest some possible steps", "medical advice"
+        "you should take", 
+        "your condition is", 
+        "diagnose", 
+        "treat this symptom",
+        "take this medication", 
+        "suggest some possible steps",
+        "you are suffering from",
+        "prescription for"
     ]
     
     for keyword in medical_advice_indicators:
@@ -51,6 +59,7 @@ def check_output_guardrail(response_text: str) -> str:
             )
             
     return sanitized
+
 # ----------------------------------------------------------------------
 # LOCAL COMBINED PERIMETER GATE TESTER
 # ----------------------------------------------------------------------
@@ -72,8 +81,8 @@ if __name__ == "__main__":
     # Validate Output Perimeter
     print("\n[TESTING OUTBOUND GATEWAY]")
     output_tests = [
-        ("Your claim is processing normally.", "Your claim is processing normally."),
-        ("Based on your chart, you have cancer. Take this medication.", "⚠️ Notice: As an AI insurance assistant, I am strictly forbidden from providing clinical or diagnostic medical advice. Please consult with a licensed physician immediately regarding your symptoms or treatments.")
+        ("Your claim is processing normally. This is not medical advice.", "Your claim is processing normally. This is not medical advice."),
+        ("Based on your chart, you have cancer. Take this medication.", "⚠️ Notice: As an AI health insurance assistant, I am strictly authorized to provide coverage details...")
     ]
     for raw_out, expected_out in output_tests:
         match = "MATCH" if check_output_guardrail(raw_out)[:30] == expected_out[:30] else "MISMATCH"

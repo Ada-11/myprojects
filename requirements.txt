@@ -11,3 +11,6 @@ requests
 pandas
 pytesseract
 pypdf
+langfuse
+fastmcp
+python-dotenv

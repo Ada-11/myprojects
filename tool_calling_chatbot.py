@@ -7,432 +7,69 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field, ValidationError
 from groq import Groq
 import tiktoken
+from dotenv import load_dotenv
+
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+DB_PATH_GLOBAL = "/app/coverage-chatbot-api/coverage.db"
+if not os.path.exists(DB_PATH_GLOBAL):
+    DB_PATH_GLOBAL = "coverage-chatbot-api/coverage.db"
+
+ACTIVE_MODEL = "openai/gpt-oss-20b"
 
 # ---------------------------------------------------------
-# 1. PYDANTIC OUTPUT DATA SCHEMAS FOR STRICT VALIDATION
+# 1. MODELS & DATA (PRODUCED BY THE DB)
 # ---------------------------------------------------------
 class CoverageValidationModel(BaseModel):
-    plan_id: str = Field(..., min_length=2)
-    procedure: str = Field(..., min_length=3)
-    is_covered: bool
-    limitations: str
-    pre_authorization_required: bool
+    plan_id: str; procedure: str; is_covered: bool; limitations: str; pre_authorization_required: bool
 
 class ClaimStatusValidationModel(BaseModel):
-    claim_id: str = Field(..., min_length=4)
-    status: str = Field(..., pattern="^(paid|denied|pending_review)$")
-    submitted_amount: float = Field(..., ge=0.0)
-    allowed_amount: Optional[float] = Field(None, ge=0.0)
-    member_responsibility: Optional[float] = Field(None, ge=0.0)
-    insurance_paid: Optional[float] = Field(None, ge=0.0)
-    denial_reason: Optional[str] = None
+    claim_id: str; status: str; submitted_amount: float; allowed_amount: Optional[float]; insurance_paid: Optional[float]
 
-class PlanDetailsValidationModel(BaseModel):
-    plan_id: str = Field(..., min_length=2)
-    plan_name: str
-    monthly_premium: float = Field(..., ge=0.0)
-    annual_deductible: float = Field(..., ge=0.0)
-    copay_pct: int = Field(..., ge=0, le=100)
-    out_of_pocket_maximum: float = Field(..., ge=0.0)
-    network_tier: str
-
-class OutOfPocketValidationModel(BaseModel):
-    procedure: str
-    plan_id: str
-    average_allowed_cost: float = Field(..., ge=0.0)
-    estimated_member_deductible_impact: float = Field(..., ge=0.0)
-    estimated_coinsurance_payment: float = Field(..., ge=0.0)
-    total_estimated_out_of_pocket: float = Field(..., ge=0.0)
-
-# ---------------------------------------------------------
-# 2. MOCK DATASETS
-# ---------------------------------------------------------
+# EXTENDED MOCK DATA to handle more keywords
 MOCK_COVERAGE = [
-    {"plan_id": "P101", "procedure": "physical therapy", "is_covered": True, "limitations": "Covered up to 20 visits per calendar year.", "pre_authorization_required": False},
-    {"plan_id": "P102", "procedure": "acupuncture", "is_covered": False, "limitations": "Explicitly categorized under plan policy exclusions.", "pre_authorization_required": False},
-    {"plan_id": "P101", "procedure": "mri scan", "is_covered": True, "limitations": "Subject to annual deductible constraints.", "pre_authorization_required": True}
-]
-
-MOCK_CLAIMS = [
-    {"claim_id": "CLM9901", "status": "paid", "submitted_amount": 450.00, "allowed_amount": 350.00, "member_responsibility": 35.00, "insurance_paid": 315.00, "denial_reason": None},
-    {"claim_id": "CLM9902", "status": "denied", "submitted_amount": 1200.00, "allowed_amount": 0.00, "member_responsibility": 1200.00, "insurance_paid": 0.00, "denial_reason": "Missing required pre-authorization reference code."},
-    {"claim_id": "CLM9903", "status": "pending_review", "submitted_amount": 150.00, "allowed_amount": None, "member_responsibility": None, "insurance_paid": None, "denial_reason": None}
-]
-
-MOCK_PLANS = [
-    {"plan_id": "P101", "plan_name": "Gold PPO", "monthly_premium": 500.00, "annual_deductible": 2000.00, "copay_pct": 10, "out_of_pocket_maximum": 4000.00, "network_tier": "GOLD"},
-    {"plan_id": "P102", "plan_name": "Silver HMO", "monthly_premium": 300.00, "annual_deductible": 1500.00, "copay_pct": 20, "out_of_pocket_maximum": 5500.00, "network_tier": "SILVER"},
-    {"plan_id": "P103", "plan_name": "Bronze HMO", "monthly_premium": 150.00, "annual_deductible": 1000.00, "copay_pct": 30, "out_of_pocket_maximum": 7000.00, "network_tier": "BRONZE"}
-]
-
-MOCK_OUT_OF_POCKET = [
-    {"procedure": "knee surgery", "plan_id": "P101", "average_allowed_cost": 5000.00, "estimated_member_deductible_impact": 2000.00, "estimated_coinsurance_payment": 300.00, "total_estimated_out_of_pocket": 2300.00},
-    {"procedure": "routine evaluation", "plan_id": "P102", "average_allowed_cost": 150.00, "estimated_member_deductible_impact": 0.00, "estimated_coinsurance_payment": 30.00, "total_estimated_out_of_pocket": 30.00}
+    {"plan_id": "P101", "procedure": "deductible", "is_covered": True, "limitations": "$2,000 Annual Individual.", "pre_authorization_required": False},
+    {"plan_id": "P102", "procedure": "deductible", "is_covered": True, "limitations": "$1,500 Annual Individual.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "copay", "is_covered": True, "limitations": "10% Coinsurance.", "pre_authorization_required": False},
+    {"plan_id": "P102", "procedure": "copay", "is_covered": True, "limitations": "20% Coinsurance.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "cosmetic procedure", "is_covered": False, "limitations": "Excluded under Gold policy terms.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "physical therapy", "is_covered": True, "limitations": "20 visits/year.", "pre_authorization_required": False}
 ]
 
 # ---------------------------------------------------------
-# 3. PYTHON REALIZATION FUNCTIONS WITH INLINE PYDANTIC VALIDATION
+# 2. RUNTIME
 # ---------------------------------------------------------
-def check_coverage(plan_id: str, procedure: str) -> str:
-    p_clean = procedure.strip().lower()
-    raw_match = None
-    for item in MOCK_COVERAGE:
-        if item["plan_id"].upper() == plan_id.strip().upper() and item["procedure"] == p_clean:
-            raw_match = item
-            break
-            
-    if not raw_match:
-        raw_match = {"plan_id": plan_id, "procedure": procedure, "is_covered": False, "limitations": "No record found.", "pre_authorization_required": False}
-        
-    try:
-        validated_data = CoverageValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic structural serialization failure.", "details": ve.errors()})
-
-def get_claim_status(claim_id: str) -> str:
-    raw_match = None
-    for item in MOCK_CLAIMS:
-        if item["claim_id"].upper() == claim_id.strip().upper():
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Claim record matching target string could not be verified."})
-        
-    try:
-        validated_data = ClaimStatusValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-def get_plan_details(plan_id: str) -> str:
-    raw_match = None
-    for item in MOCK_PLANS:
-        if item["plan_id"].upper() == plan_id.strip().upper():
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Invalid plan ID tracking descriptor metadata."})
-        
-    try:
-        validated_data = PlanDetailsValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-def estimate_out_of_pocket_cost(procedure: str, plan_id: str) -> str:
-    p_clean = procedure.strip().lower()
-    raw_match = None
-    for item in MOCK_OUT_OF_POCKET:
-        if item["plan_id"].upper() == plan_id.strip().upper() and item["procedure"] == p_clean:
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Custom out-of-pocket projection details unavailable."})
-        
-    try:
-        validated_data = OutOfPocketValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-# ---------------------------------------------------------
-# 4. SCHEMAS FOR GROQ TOOLS ARRAY PARAMETERS
-# ---------------------------------------------------------
-TOOLS_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_coverage",
-            "description": "Checks if a specific medical procedure or treatment is covered under a member's insurance plan ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan_id": {"type": "string", "description": "The insurance plan ID (e.g., 'P101', 'P102')."},
-                    "procedure": {"type": "string", "description": "The medical procedure name (e.g., 'physical therapy')."}
-                },
-                "required": ["plan_id", "procedure"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_claim_status",
-            "description": "Retrieves the current processing state, adjudication status, and payment breakdown for a submitted insurance claim ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "claim_id": {"type": "string", "description": "The unique alphanumeric string identifying the submitted medical claim (e.g., 'CLM9901')."}
-                },
-                "required": ["claim_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_plan_details",
-            "description": "Retrieves core cost-sharing metrics, monthly premiums, and deductible tracking totals for an insurance plan ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan_id": {"type": "string", "description": "The primary alphanumeric tracking ID of the targeted insurance tier."}
-                },
-                "required": ["plan_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "estimate_out_of_pocket_cost",
-            "description": "Calculates an estimated member cost summary for a procedure based on a plan's specific coinsurance, deductible, and historical reference rates.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "procedure": {"type": "string", "description": "The medical treatment or service name to evaluate (e.g., 'knee surgery')."},
-                    "plan_id": {"type": "string", "description": "The active insurance plan ID to execute calculation metrics against."}
-                },
-                "required": ["procedure", "plan_id"]
-            }
-        }
-    }
-]
-
-# ----------------------------------------------------------------------
-# 4.5 UNIFIED AUTOMATED MEMORY COMPRESSION & TOKEN COUNTING UTILITIES
-# ----------------------------------------------------------------------
-def count_tokens_in_history(messages_list: list, model_name: str = "gpt-3.5-turbo") -> int:
-    """Calculates exact token weight footprint of a message array stack."""
-    try:
-        encoding_engine = tiktoken.encoding_for_model(model_name)
-    except KeyError:
-        encoding_engine = tiktoken.get_encoding("cl100k_base")
-        
-    total_tokens = 0
-    for message in messages_list:
-        total_tokens += 4  
-        total_tokens += len(encoding_engine.encode(message.get("content", "")))
-        total_tokens += len(encoding_engine.encode(message.get("role", "")))
-    total_tokens += 2  
-    return total_tokens
-
-def prune_and_summarize_session_history(session_id: str, db_path: str, groq_client: Groq):
-    """Measures token metrics and condenses oldest 50% of history when threshold is breached."""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT id, role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        all_rows = cursor.fetchall()
-        
-        formatted_messages = [{"role": r, "content": c} for _, r, c in all_rows]
-        token_count_before = count_tokens_in_history(formatted_messages)
-        
-        print(f"\n[TOKEN TELEMETRY] Session: {session_id} | Pre-Check Token Weight: {token_count_before} tokens")
-        
-        # Threshold flag check boundary (~2000 tokens)
-        if token_count_before <= 2000:
-            print(f"[TOKEN TELEMETRY] Status: SAFE ({token_count_before}/2000 tokens). Skipping pruning gate.")
-            conn.close()
-            return
-            
-        print(f"⚠️ [MEMORY CRITICAL] Session {session_id} at {token_count_before} tokens. Compressing thread window...")
-        
-        split_index = len(all_rows) // 2
-        rows_to_summarize = all_rows[:split_index]
-        
-        digest_text = ""
-        for _, role, content in rows_to_summarize:
-            digest_text += f"{role.upper()}: {content}\n"
-            
-        summary_prompt = (
-            "You are an internal system log compression daemon engine.\n"
-            "Summarize the conversation transcript below into a single, highly dense, concise paragraph.\n"
-            "Ensure you capture all specified alphanumeric data vectors accurately.\n"
-            "Return ONLY the summary paragraph text with no extra remarks.\n\n"
-            f"Transcript Log to Compress:\n{digest_text}"
-        )
-        
-        summary_response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": summary_prompt}],
-            temperature=0.0
-        )
-        condensed_summary_string = summary_response.choices[0].message.content.strip()
-        
-        row_ids_to_delete = [row for row in rows_to_summarize]
-        cursor.execute(
-            f"DELETE FROM conversations WHERE id IN ({','.join(['?'] * len(row_ids_to_delete))})",
-            row_ids_to_delete
-        )
-        
-        cursor.execute(
-            "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (
-                session_id, 
-                "system", 
-                f"[SYSTEM CONVERSATION SUMMARY OF OLDER TURNS]: {condensed_summary_string}", 
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
-        )
-        conn.commit()
-        
-        cursor.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        updated_rows = cursor.fetchall()
-        conn.close()
-        
-        updated_messages = [{"role": r, "content": c} for r, c in updated_rows]
-        token_count_after = count_tokens_in_history(updated_messages)
-        
-        print(f"✅ [MEMORY OPTIMIZED] Summarization complete for Session: {session_id}")
-        print(f"[TOKEN TELEMETRY] Post-Compression Token Weight: {token_count_after} tokens (Saved: {token_count_before - token_count_after} tokens)\n")
-        
-    except Exception as e:
-        print(f"[WARN] Memory compression thread experienced an exception: {str(e)}")
-
-# ----------------------------------------------------------------------
-# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN PIPELINE WITH HISTORY INJECTION
-# ----------------------------------------------------------------------
 def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True, session_id: str = "DEFAULT-SESS"):
-    """Executes agent loop using token-streaming and pulls last 10 messages from absolute SQLite path."""
-    api_key_env = os.environ.get("GROQ_API_KEY")
-    if not api_key_env:
-        yield f"data: {json.dumps({'error': 'Missing internal platform credentials'})}\n\n"
-        return
+    with langfuse.start_as_current_observation(name="llm_agent_run", input=user_query, metadata={"session_id": session_id}) as generation:
+        api_key = os.environ.get("GROQ_API_KEY")
+        client = Groq(api_key=api_key)
+        
+        messages = [
+            {"role": "system", "content": "You are a professional Health Insurance Navigator. No medical advice. Talk text only."},
+            {"role": "user", "content": user_query}
+        ]
 
-    client = Groq(api_key=api_key_env)
-    
-    # FORCED UNIFIED ABSOLUTE DB DATABASE PATH LAYER
-    db_path = "/Users/ada/myprojects/my-first-app/coverage-chatbot-api/coverage.db"
-
-    # Trigger single pruning evaluation gate check pass before constructing system strings
-    prune_and_summarize_session_history(session_id, db_path, client)
-
-    historical_turns = []
-    remembered_plan_id = "Not Specified Yet"
-    
-    try:
-        if os.path.exists(db_path):
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-                (session_id,)
+        try:
+            response = client.chat.completions.create(model=ACTIVE_MODEL, messages=messages, temperature=0.0)
+            final_text = response.choices[0].message.content
+            
+            generation.update(
+                output=final_text, model=ACTIVE_MODEL,
+                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens}
             )
-            rows = cursor.fetchall()
-            conn.close()
-            
-            for role, content in rows:
-                historical_turns.append({"role": role, "content": content})
-                content_upper = content.upper()
-                if "P101" in content_upper or "GOLD PPO" in content_upper:
-                    remembered_plan_id = "P101 (Gold PPO)"
-                elif "P102" in content_upper or "SILVER HMO" in content_upper:
-                    remembered_plan_id = "P102 (Silver HMO)"
-                elif "P103" in content_upper or "BRONZE HMO" in content_upper:
-                    remembered_plan_id = "P103 (Bronze HMO)"
-    except Exception as db_err:
-        print(f"[WARN] Failed to pull context arrays from SQLite tracking ledger: {str(db_err)}")
 
-    sliding_window_history = historical_turns[-10:] if len(historical_turns) > 10 else historical_turns
+            if stream:
+                yield f"data: {json.dumps({'token': final_text})}\n\n"
+            else:
+                return final_text
 
-    system_prompt = (
-        "You are an advanced health insurance navigation assistant combining structural compliance limits with an accessible, professional tone.\n"
-        "1. ACCURATE AND EMPATHETIC BALANCE: State all tool-returned metrics, deductibles, and coverage statuses with literal precision.\n"
-        "2. MEDICAL DEFLECTION GUARDRAIL: If the user mentions health symptoms, state clearly that you cannot evaluate conditions and direct them to their doctor.\n"
-        "3. TERMINOLOGY GUARDRAIL: Always define 'deductible' in plain language on first use.\n"
-        "4. STANDARD CLOSING DISCLAIMER: Conclude with this exact standalone paragraph: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'\n\n"
-        "----------------------------------------------------------------------\n"
-        "⚙️ TRACKED MEMBER SESSION PARAMETERS (PLAN-MEMORY STORAGE LAYER):\n"
-        f"*   Remembered Insurance Policy Plan ID for Session: {remembered_plan_id}\n"
-        "----------------------------------------------------------------------\n"
-    )
-
-    if external_context:
-        system_prompt += f"\n\nRetrieved RAG Context Layer Material:\n{external_context}"
-
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    for turn in sliding_window_history:
-        messages.append({"role": turn["role"], "content": turn["content"]})
-        
-    messages.append({"role": "user", "content": user_query})
-
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            tools=TOOLS_SCHEMAS,
-            tool_choice="auto",
-            temperature=0.0
-        )
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
-    except Exception as api_err:
-        yield f"data: {json.dumps({'error': f'Inference gateway connection loss: {str(api_err)}'})}\n\n"
-        return
-
-    if tool_calls:
-        messages.append(response_message)
-        available_functions = {
-            "check_coverage": check_coverage,
-            "get_claim_status": get_claim_status,
-            "get_plan_details": get_plan_details,
-            "estimate_out_of_pocket_cost": estimate_out_of_pocket_cost
-        }
-
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
-            
-            if function_name not in available_functions:
-                continue
-                
-            function_to_call = available_functions[function_name]
-            validated_json_string = function_to_call(**function_args)
-
-            messages.append({
-                "tool_call_id": tool_call.id,
-                "role": "tool",
-                "name": function_name,
-                "content": validated_json_string
-            })
-
-    try:
-        completion_stream = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.0,
-            stream=True
-        )
-        
-        for chunk in completion_stream:
-            token_text = chunk.choices[0].delta.content
-            if token_text:
-                payload = {"token": token_text}
-                yield f"data: {json.dumps(payload)}\n\n"
-    except Exception as stream_fault:
-        payload = {"error": f"Mid-stream network exception: {str(stream_fault)}"}
-        yield f"data: {json.dumps(payload)}\n\n"
-
-# ----------------------------------------------------------------------
-# ENDPOINT CONNECTOR MODULE ROUTING GATE
-# ----------------------------------------------------------------------
-def generate_answer(user_query: str, context_block: str = "", session_id: str = "DEFAULT-SESS"):
-    return run_agent_loop(user_query, context_block, stream=True, session_id=session_id)
-
+        except Exception as api_err:
+            generation.update(level="ERROR", status_message=str(api_err))
+            yield f"data: {json.dumps({'error': str(api_err)})}\n\n"
+    langfuse.flush()
 
 if __name__ == "__main__":
-    for sse_line in run_agent_loop("What is my deductible?", session_id="TEST-SESS-001"):
+    for sse_line in run_agent_loop("Is physical therapy covered?", session_id="CLI-STABLE"):
         print(sse_line.strip())

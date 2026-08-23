@@ -7,358 +7,191 @@ from typing import Literal, TypedDict, List
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
-from groq import BadRequestError
+from dotenv import load_dotenv
 
-# Import low-level MCP asynchronous transport clients
+# --- INITIALIZE ---
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+ACTIVE_MODEL = "openai/gpt-oss-20b"
+# Use absolute path for K8s, relative for local
+DB_PATH = "/app/coverage-chatbot-api/coverage.db"
+if not os.path.exists("/app"):
+    DB_PATH = "coverage-chatbot-api/coverage.db"
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 from guardrails_config import check_input_guardrail, check_output_guardrail
-from redact_pii import redact_pii
 
-# Ensure parent directory is accessible for local module resolutions
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from tool_calling_chatbot import (
-    check_coverage as native_check_coverage,
-    get_claim_status as native_get_claim_status
-)
-
-# Define absolute database tracking path matching your Day 20 specifications
-DB_PATH = "/Users/ada/myprojects/my-first-app/coverage-chatbot-api/coverage.db"
-
-# ----------------------------------------------------------------------
-# 1. STATE MANAGEMENT CONTRACT
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 1. STATE & ROUTING CONTRACTS
+# ---------------------------------------------------------
 class AgentGraphState(TypedDict):
-    """Unified state tracking matrix holding message bundles and tracking tags."""
     messages: List[dict]
     next_node: str
     user_query: str
     final_output: str
-    session_id: str  # Injected persistent tracking descriptor key
+    session_id: str 
 
 class RouteDecision(BaseModel):
-    """Structured Pydantic contract enforcing deterministic routing paths."""
     intent_classification: Literal["coverage", "claims", "enrollment"]
     next_action_node: Literal["CoverageSpecialist", "ClaimsSpecialist", "EnrollmentHandler"]
     routing_reasoning: str
 
-# ----------------------------------------------------------------------
-# 2. SQLITE HISTORY EXTRACTION & PLAN MEMORY SINK UTILITY
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 2. UTILITIES
+# ---------------------------------------------------------
 def load_session_history_and_plan(session_id: str) -> tuple:
-    """
-    Connects to the Day 20 SQLite ledger to load the sliding window history 
-    and identify any previously specified plan selections.
-    """
     historical_turns = []
     remembered_plan_id = "Not Specified Yet"
-    
-    if not os.path.exists(DB_PATH):
-        return [], remembered_plan_id
-        
+    if not os.path.exists(DB_PATH): return [], remembered_plan_id
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        
+        cursor.execute("SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC", (session_id,))
+        rows = cursor.fetchall(); conn.close()
         for role, content in rows:
             historical_turns.append({"role": role, "content": content})
-            content_upper = content.upper()
-            if "P101" in content_upper or "GOLD PPO" in content_upper:
-                remembered_plan_id = "P101 (Gold PPO)"
-            elif "P102" in content_upper or "SILVER HMO" in content_upper:
-                remembered_plan_id = "P102 (Silver HMO)"
-            elif "P103" in content_upper or "BRONZE HMO" in content_upper:
-                remembered_plan_id = "P103 (Bronze HMO)"
-    except Exception as e:
-        print(f"[WARN] Failed fetching SQLite history frame: {str(e)}", file=sys.stderr)
-        
-    # Isolate rolling last 10 messages (sliding window) to save context tokens
-    sliding_window = historical_turns[-10:] if len(historical_turns) > 10 else historical_turns
-    return sliding_window, remembered_plan_id
+            c_up = content.upper()
+            if "P101" in c_up or "GOLD" in c_up: remembered_plan_id = "P101 (Gold PPO)"
+            elif "P102" in c_up or "SILVER" in c_up: remembered_plan_id = "P102 (Silver HMO)"
+    except Exception: pass
+    return historical_turns[-10:], remembered_plan_id
 
-# ----------------------------------------------------------------------
-# 3. CHAOS-DEFENDED UNIVERSAL MCP TOOL RUNNER CLIENT LAYER
-# ----------------------------------------------------------------------
 async def call_mcp_tool(tool_name: str, tool_args: dict) -> str:
-    """
-    Asynchronous MCP client with a 10-second timeout, 1-pass retry logic,
-    and a graceful, non-crashing member support deflection fallback wrapper.
-    """
-    server_params = StdioServerParameters(
-        command="python3",
-        args=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")]
-    )
-    
-    # Define our strict production chaos parameters
-    MAX_ATTEMPTS = 2  # Primary attempt + exactly 1 retry
-    TIMEOUT_SECONDS = 10.0
-    CANNED_FALLBACK_RESPONSE = (
-        "⚠️ I'm having trouble accessing that policy database right now. "
-        "Please contact member support directly at 1-800-555-0199 for real-time assistance, "
-        "or try again in a few moments."
-    )
-    
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    with langfuse.start_as_current_observation(name=f"mcp_{tool_name}", input=tool_args) as span:
+        server_params = StdioServerParameters(
+            command=sys.executable, 
+            args=[os.path.join(os.getcwd(), "mcp_server.py")]
+        )
         try:
-            print(f"📡 [MCP CLIENT WIRE] Execution Attempt #{attempt} for tool '{tool_name}'...")
-            
-            # Enforce an explicit execution timeframe cap boundary
-            async with asyncio.timeout(TIMEOUT_SECONDS):
+            async with asyncio.timeout(10.0):
                 async with stdio_client(server_params) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
-                        # Negotiate JSON-RPC parameters
                         await session.initialize()
-                        
-                        # Fire request down the transport channel
                         result = await session.call_tool(tool_name, arguments=tool_args)
-                        
-                        if result and result.content and len(result.content) > 0:
-                            # Return the successful payload instantly, breaking the retry loop
-                            return result.content[0].text
-                            
-                        raise ValueError("Empty or malformed payload returned from protocol server.")
-                        
-        except asyncio.TimeoutError:
-            print(f"⏳ [TIMEOUT BREACH] Attempt #{attempt} exceeded the {TIMEOUT_SECONDS}s window threshold limit.", file=sys.stderr)
+                        output = result.content[0].text if result and result.content else "No Data Found"
+                        span.update(output=output)
+                        return output
         except Exception as e:
-            print(f"💥 [TOOL RUNTIME CRASH] Attempt #{attempt} encountered an exception error: {str(e)}", file=sys.stderr)
-            
-        # Give the sub-process engine a micro-pause to settle before firing a retry pass
-        if attempt < MAX_ATTEMPTS:
-            await asyncio.sleep(0.5)
+            span.update(level="ERROR", status_message=str(e))
+            return "⚠️ Database connectivity error."
 
-    # 🛑 OVERFLOW GATE: If both attempts are exhausted, intercept the failure gracefully
-    print("🛡️ [CHAOS DEFENSE ACTIVATED] Tool chain exhausted. Deflecting to user-friendly canned support message.")
-    return CANNED_FALLBACK_RESPONSE
-
-# ----------------------------------------------------------------------
-# 4. MEMORY-GROUNDED AGENT GRAPH NODES
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 3. NODES
+# ---------------------------------------------------------
 async def router_node(state: AgentGraphState) -> dict:
-    """
-    Supervisor Router: Classifies user intent and sets the target lane.
-    Hardened with a try/except closure to catch adversarial tool-use validation crashes.
-    """
-    print("\n" + "="*15 + " 🔀 NODE 1: SUPERVISOR ROUTER " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    structured_router = llm.with_structured_output(RouteDecision)
-    
-    system_prompt = (
-        "Analyze the query and pick the single best specialist agent node.\n"
-        "MAPPING RULES:\n"
-        "1. Policy rules, inclusions, visit limits -> route to 'CoverageSpecialist'.\n"
-        "2. Claims state, paid amounts, denials, billing -> route to 'ClaimsSpecialist'.\n"
-        "3. Premium costs, HR setup, enrollments -> route to 'EnrollmentHandler'."
-    )
-    user_query_text = state.get("user_query", "")
-    
-    try:
-        # Attempt standard structured classification
-        routing_result: RouteDecision = structured_router.invoke(f"{system_prompt}\n\nUser Query: {user_query_text}")
-        print(f"▶ Target Specialist Selected: `{routing_result.next_action_node}`")
-        return {"next_node": routing_result.next_action_node}
+    with langfuse.start_as_current_observation(name="supervisor_router", input=state["user_query"]) as span:
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        structured_router = llm.with_structured_output(RouteDecision)
         
-    except BadRequestError as groq_err:
-        # 🛡️ THE EXCEPTION SHIELD: Catch malicious schema evasion attacks
-        print(f"🚨 [ADVERSARIAL HIJACK DETECTED] Groq tool-use validation failed: {str(groq_err)}", file=sys.stderr)
+        prompt = (
+            "You are a routing supervisor. Categorize the query:\n"
+            "1. Deductibles, copays, coverage limits, specific procedure costs -> 'CoverageSpecialist'\n"
+            "2. Claims, payments, CLM IDs, denial reasons -> 'ClaimsSpecialist'\n"
+            "3. Enrollment, portals, HR, member IDs -> 'EnrollmentHandler'\n"
+            f"User Query: {state['user_query']}"
+        )
         
-        # Override the routing target and send the state to the EnrollmentHandler node 
-        # to prevent script failure and provide a safe error message
-        return {"next_node": "EnrollmentHandler"}
+        try:
+            decision = structured_router.invoke(prompt)
+            span.update(output=decision.next_action_node)
+            return {"next_node": decision.next_action_node}
+        except:
+            return {"next_node": "EnrollmentHandler"}
 
 async def coverage_specialist_node(state: AgentGraphState) -> dict:
-    """Agent 2: Coverage Specialist utilizing memory and live MCP tools."""
-    print("\n" + "="*15 + " 🛡️ NODE 2: POLICY COVERAGE EXPERT " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    user_query_text = state.get("user_query", "")
-    
-    # Read history to find plan_id if omitted in the current user prompt turn
-    history, remembered_plan_id = load_session_history_and_plan(state.get("session_id", "DEFAULT-SESS"))
-    
-    plan_id = "P101" # Default fallback
-    if "p102" in remembered_plan_id.lower() or "p102" in user_query_text.lower(): plan_id = "P102"
-    elif "p103" in remembered_plan_id.lower() or "p103" in user_query_text.lower(): plan_id = "P103"
-    elif "p101" in remembered_plan_id.lower() or "p101" in user_query_text.lower(): plan_id = "P101"
-    
-    procedure = "physical therapy"
-    if "acupuncture" in user_query_text.lower(): procedure = "acupuncture"
-    elif "mri" in user_query_text.lower(): procedure = "mri scan"
-    
-    print(f"[CONTEXT EXECUTION] Evaluated Plan Context: {plan_id} (Resolved from memory storage layer)")
-    mcp_response_json = await call_mcp_tool("check_coverage", {"plan_id": plan_id, "procedure": procedure})
-    
-    instruction_prompt = (
-        "Context: You are an elite Health Insurance Policy Coverage Specialist.\n"
-        f"Remembered Session Plan ID context: {plan_id}\n"
-        "Instruction: Summarize procedure coverage rules accurately from the tool data.\n"
-        "Conclude with this exact disclaimer: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'"
-    )
-    
-    # Construct complete prompt compiling sliding conversation turns
-    prompt_messages = [{"role": "system", "content": instruction_prompt}]
-    for turn in history:
-        prompt_messages.append({"role": turn["role"], "content": turn["content"]})
-    prompt_messages.append({"role": "user", "content": user_query_text})
-    prompt_messages.append({"role": "system", "content": f"Live MCP Server Output Result:\n{mcp_response_json}"})
-    
-    response = llm.invoke(prompt_messages)
-    return {"final_output": response.content.strip()}
+    with langfuse.start_as_current_observation(name="coverage_expert") as span:
+        query = state["user_query"].lower()
+        history, history_plan = load_session_history_and_plan(state["session_id"])
+        
+        # PLAN IDENTIFICATION LOGIC
+        p_id = "P101" # Default
+        if "silver" in query or "p102" in query or "silver" in history_plan.lower():
+            p_id = "P102"
+        elif "gold" in query or "p101" in query or "gold" in history_plan.lower():
+            p_id = "P101"
+
+        # PROCEDURE IDENTIFICATION
+        proc = "general coverage"
+        if "deductible" in query: proc = "deductible"
+        elif "copay" in query: proc = "copay"
+        elif "mri" in query: proc = "mri scan"
+        elif "cosmetic" in query: proc = "cosmetic procedure"
+        elif "physical therapy" in query: proc = "physical therapy"
+
+        # Step 1: Tool Call to the MCP Database
+        mcp_res = await call_mcp_tool("check_coverage", {"plan_id": p_id, "procedure": proc})
+        
+        # Step 2: Professional Synthesis
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        prompt = [
+            {"role": "system", "content": (
+                "You are an Elite Policy Coverage Reporter. Your task is to report the specific data retrieved from tools.\n"
+                f"RETRIEVED TOOL DATA: {mcp_res}\n"
+                "RULES:\n"
+                "1. If the tool data provides a deductible or copay, state it clearly.\n"
+                "2. If the tool says 'is_covered: False' or 'No record', explain that the specific item is not covered or requires manual support.\n"
+                "3. Speak professionally. DO NOT mention tool calls. DO NOT output JSON.\n"
+                "4. Conclude with: 'This is a structural coverage determination. Not medical advice.'"
+            )},
+            *history,
+            {"role": "user", "content": state["user_query"]}
+        ]
+        
+        try:
+            response = llm.invoke(prompt)
+            span.update(output=response.content)
+            return {"final_output": response.content.strip()}
+        except Exception:
+            return {"final_output": f"Based on your policy ({p_id}), the data for {proc} indicates: {mcp_res}. Contact support at 1-800-555-0199 for more details."}
 
 async def claims_specialist_node(state: AgentGraphState) -> dict:
-    """Agent 3: Claims Specialist node utilizing conversation memory logs."""
-    print("\n" + "="*15 + " 📄 NODE 3: CLAIMS ADJUDICATION EXPERT " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    user_query_text = state.get("user_query", "")
-    
-    history, _ = load_session_history_and_plan(state.get("session_id", "DEFAULT-SESS"))
-    
-    claim_id = "CLM9901"
-    if "clm9902" in user_query_text.lower(): claim_id = "CLM9902"
-    elif "clm9903" in user_query_text.lower(): claim_id = "CLM9903"
-    
-    mcp_response_json = await call_mcp_tool("get_claim_status", {"claim_id": claim_id})
-    
-    instruction_prompt = (
-        "Context: You are an expert Health Insurance Claims Adjudication Specialist.\n"
-        "Instruction: Report the processing status, financial tracking, and denials with literal precision."
-    )
-    
-    prompt_messages = [{"role": "system", "content": instruction_prompt}]
-    for turn in history:
-        prompt_messages.append({"role": turn["role"], "content": turn["content"]})
-    prompt_messages.append({"role": "user", "content": user_query_text})
-    prompt_messages.append({"role": "system", "content": f"Live MCP Server Output Result:\n{mcp_response_json}"})
-    
-    response = llm.invoke(prompt_messages)
-    return {"final_output": response.content.strip()}
+    with langfuse.start_as_current_observation(name="claims_expert") as span:
+        history, _ = load_session_history_and_plan(state["session_id"])
+        
+        # Extract Claim ID
+        c_id = "CLM9901"
+        if "clm9902" in state["user_query"].lower(): c_id = "CLM9902"
+        elif "clm9903" in state["user_query"].lower(): c_id = "CLM9903"
+        
+        mcp_res = await call_mcp_tool("get_claim_status", {"claim_id": c_id})
+        
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        prompt = [
+            {"role": "system", "content": "You are a Claims Adjudication reporter. Summarize the provided claim data. No tool calls or JSON."},
+            *history,
+            {"role": "user", "content": state["user_query"]},
+            {"role": "system", "content": f"DATA: {mcp_res}"}
+        ]
+        response = llm.invoke(prompt)
+        span.update(output=response.content)
+        return {"final_output": response.content.strip()}
 
 async def enrollment_handler_node(state: AgentGraphState) -> dict:
-    """Agent 4: Enrollment and General Corporate Inquiries Fallback Handler."""
-    print("\n" + "="*15 + " 📋 NODE 4: ENROLLMENT GATEWAY HANDLER " + "="*15)
-    
-    query = state.get("user_query", "").lower()
-    
-    # Check if the query is an off-topic request passed down by the router
-    if "gaming pc" in query or "pc assembly" in query or "marketing description" in query:
-        return {"final_output": "Our insurance assistant handles benefit coverage rules and claims lookups only. For corporate marketing requests, please reference our separate public web portals."}
-        
-    return {"final_output": "Enrollment inquiries and premium schedules are managed securely via our separate Corporate HR gateway portal."}
+    with langfuse.start_as_current_observation(name="enrollment_handler") as span:
+        res = "Enrollment inquiries and member ID requests are managed via the secure Corporate HR Portal. Please log in to your dashboard for those updates."
+        span.update(output=res)
+        return {"final_output": res}
 
-# ----------------------------------------------------------------------
-# 5. ASSEMBLE GRAPH WORKFLOW MATRIX
-# ----------------------------------------------------------------------
+# --- ASSEMBLE ---
 workflow_graph = StateGraph(AgentGraphState)
 workflow_graph.add_node("SupervisorRouter", router_node)
 workflow_graph.add_node("CoverageSpecialist", coverage_specialist_node)
 workflow_graph.add_node("ClaimsSpecialist", claims_specialist_node)
 workflow_graph.add_node("EnrollmentHandler", enrollment_handler_node)
-
 workflow_graph.add_edge(START, "SupervisorRouter")
-workflow_graph.add_conditional_edges(
-    "SupervisorRouter",
-    lambda state: state.get("next_node", "EnrollmentHandler"),
-    {
-        "CoverageSpecialist": "CoverageSpecialist",
-        "ClaimsSpecialist": "ClaimsSpecialist",
-        "EnrollmentHandler": "EnrollmentHandler"
-    }
-)
+workflow_graph.add_conditional_edges("SupervisorRouter", lambda s: s["next_node"])
 workflow_graph.add_edge("CoverageSpecialist", END)
 workflow_graph.add_edge("ClaimsSpecialist", END)
 workflow_graph.add_edge("EnrollmentHandler", END)
-
 multi_agent_application_mesh = workflow_graph.compile()
 
-# ----------------------------------------------------------------------
-# ASYNCHRONOUS CONSOLE LOOP RUNNER BLOCK
-# ----------------------------------------------------------------------
-async def main_async_loop():
-    print("=" * 60)
-    print("🕸️ HARDENED MCP MULTI-AGENT STATE GRAPH ACTIVE")
-    print("Type your insurance question and press Enter. Type 'exit' to quit.")
-    print("=" * 60)
-    
-    SESSION_ID_TAG = "CHAT-PERSIST-99"
-
-    while True:
-        try:
-            user_input = await asyncio.to_thread(input, "\nYou: ")
-            user_input = user_input.strip()
-            if not user_input or user_input.lower() in ["exit", "quit", "q"]:
-                break
-                
-            # 🔒 SECURITY BLOCK 1: CHECK INBOUND GUARDRAILS IMMEDIATELY
-            if not check_input_guardrail(user_input):
-                print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
-                print("⚠️ Security Access Exception: Malicious, off-topic, or unauthorized data access prompt signature detected.")
-                print("="*60 + "\n")
-                continue # Skip processing and reset the loop for the next question
-
-            # Save raw incoming user query to SQLite history tables safely
-            try:
-                from datetime import datetime, timezone
-                import sqlite3
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                    (SESSION_ID_TAG, "user", user_input, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-
-            initial_state: AgentGraphState = {
-                "user_query": user_input,
-                "messages": [],
-                "next_node": "",
-                "final_output": "",
-                "session_id": SESSION_ID_TAG
-            }
-            
-            # Execute the graph workflow safely
-            final_computed_state = await multi_agent_application_mesh.ainvoke(initial_state)
-            ans = final_computed_state.get("final_output", "Error processing.")
-            
-            # 🔒 SECURITY BLOCK 2: CHECK OUTBOUND GUARDRAILS ON GENERATED ANSWER
-            ans = check_output_guardrail(ans)
-            
-            # Save assistant's safe answer down to disk logs
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                    (SESSION_ID_TAG, "assistant", ans, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-            
-            # 🔒 SECURITY BLOCK 3: ANONYMIZE TRANSCRIPTS FOR REPOSITORY LOGS ONLY
-            safe_log_prompt = redact_pii(user_input)
-            safe_log_response = redact_pii(ans)
-            print(f"\n[AUDIT LOG ENTRY] User: {safe_log_prompt} | Assistant: {safe_log_response}")
-            
-            print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
-            print(ans)
-            print("="*60 + "\n")
-            
-        except KeyboardInterrupt:
-            break
-
 if __name__ == "__main__":
-    asyncio.run(main_async_loop())
+    async def run():
+        print("🕸️ MULTI-AGENT STATE GRAPH CLI")
+        res = await multi_agent_application_mesh.ainvoke({"user_query": "Deductible for gold?", "session_id": "CLI"})
+        print(f"AI: {res['final_output']}")
+        langfuse.flush()
+    asyncio.run(run())

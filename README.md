@@ -43,7 +43,7 @@ Probes: Liveness and Readiness probes ensure the backend has loaded heavy ML mod
 ### 📄 Project repo structure
 
 <details>
-<summary>Project repo structure</summary>
+<summary>Click to expand and view the text file</summary>
 
 ```program-repo/
 ├── k8s/                         # Kubernetes manifests (Deployments, Services)
@@ -59,7 +59,6 @@ Probes: Liveness and Readiness probes ensure the backend has loaded heavy ML mod
 ```
 
 </details>
-
 
 🛠️ Observability & Debugging
 The system is integrated with Langfuse v4 using a manual stateful client approach. This provides a "thought-trace" for every user query, showing exactly how the Supervisor decided on a route and how the Specialist formulated the answer.

@@ -171,6 +171,7 @@ async def handle_chat_endpoint(payload: ChatRequest):
     """
     Main Chat Interface. 
     Returns a StreamingResponse (SSE) compatible with the Streamlit UI.
+    Updated with Structured Bridge to send Card Data.
     """
     
     async def event_generator():
@@ -187,32 +188,31 @@ async def handle_chat_endpoint(payload: ChatRequest):
             
             user_raw_input = payload.message
             
-            # 🔒 RATE LIMIT GATEWAY: Intercept spam attempts
+            # 🔒 RATE LIMIT GATEWAY
             if is_rate_limited(payload.session_id):
                 trace.update(status_message="Rate Limit Triggered")
-                yield f"data: {json.dumps({'error': 'Rate limit exceeded. Please wait 60 seconds.'})}\n\n"
+                yield f"data: {json.dumps({'error': 'Rate limit exceeded.'})}\n\n"
                 return
             
-            # 🔒 SECURITY BLOCK: Check inbound guardrails for injection/PII
+            # 🔒 SECURITY BLOCK: Inbound
             if not check_input_guardrail(user_raw_input):
-                trace.update(status_message="Inbound Block", output="Security Access Exception")
-                yield f"data: {json.dumps({'error': 'Security Access Exception: Prompt signature blocked.'})}\n\n"
+                trace.update(status_message="Inbound Block")
+                yield f"data: {json.dumps({'error': 'Security Access Exception.'})}\n\n"
                 return
 
-            # 🚀 CACHE READ HIT: Hashed exact match lookup
+            # 🚀 CACHE READ HIT
             q_hash = get_question_hash(user_raw_input)
             cache_eligible = is_eligible_for_caching(user_raw_input)
             
             if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
-                cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
-                trace.update(output=cached_reply, metadata={"cache": "hit"})
-                yield f"data: {json.dumps({'token': cached_reply})}\n\n"
+                cached_data = GENERAL_RESPONSE_CACHE[q_hash]
+                trace.update(output=cached_data['token'], metadata={"cache": "hit"})
+                yield f"data: {json.dumps(cached_data)}\n\n"
                 return
 
             # 🕸️ AGENT GRAPH EXECUTION SPAN
             with langfuse.start_as_current_observation(name="agent_graph_execution") as span:
                 try:
-                    # Dynamic import to ensure current graph state
                     from multi_agent import multi_agent_application_mesh
                     
                     initial_state = {
@@ -220,39 +220,33 @@ async def handle_chat_endpoint(payload: ChatRequest):
                         "session_id": payload.session_id,
                         "messages": [],
                         "next_node": "",
-                        "final_output": ""
+                        "final_output": "",
+                        "card_type": None,
+                        "card_payload": None
                     }
                     
-                    # Execute the asynchronous graph
                     computed_final_state = await multi_agent_application_mesh.ainvoke(initial_state)
-                    assistant_generated_reply = computed_final_state.get("final_output", "No response generated.")
+                    
+                    assistant_generated_reply = computed_final_state.get("final_output", "No response.")
+                    detected_card_type = computed_final_state.get("card_type")
+                    detected_card_payload = computed_final_state.get("card_payload")
                     
                     span.update(output=assistant_generated_reply)
                     
                 except Exception as err:
-                    assistant_generated_reply = f"System lookup failure: {str(err)}"
+                    assistant_generated_reply = f"System failure: {str(err)}"
+                    detected_card_type, detected_card_payload = None, None
                     span.update(level="ERROR", status_message=str(err))
 
-            # 🔒 SECURITY BLOCK: Run outbound guardrails (Medical Deflection)
+            # 🔒 SECURITY BLOCK: Outbound
             final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
-            
-            # ⚡ CACHE WRITE: Store successful general inquiries
-            if cache_eligible:
-                GENERAL_RESPONSE_CACHE[q_hash] = final_sanitized_ui_response
             
             # 🧮 TOKEN TELEMETRY
             prompt_token_count = count_tokens(user_raw_input)
             completion_token_count = count_tokens(final_sanitized_ui_response)
-            
-            # Update Langfuse with exact token usage
             trace.update(
                 output=final_sanitized_ui_response,
-                usage={
-                    "input": prompt_token_count, 
-                    "output": completion_token_count,
-                    "total": prompt_token_count + completion_token_count,
-                    "unit": "TOKENS"
-                }
+                usage={"input": prompt_token_count, "output": completion_token_count}
             )
 
             # 📊 PERSISTENT TRANSACTION LOGGING
@@ -261,14 +255,11 @@ async def handle_chat_endpoint(payload: ChatRequest):
                 cursor = conn.cursor()
                 now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 
-                # Save conversation history
                 cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
                                (payload.session_id, "user", user_raw_input, now_ts))
                 cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
                                (payload.session_id, "assistant", final_sanitized_ui_response, now_ts))
                 
-                # Financial tracking calculation
-                # Rates: $0.05 per 1M Input / $0.08 per 1M Output
                 estimated_cost = (prompt_token_count * (0.05/1000000)) + (completion_token_count * (0.08/1000000))
                 cursor.execute("""
                     INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost)
@@ -278,16 +269,21 @@ async def handle_chat_endpoint(payload: ChatRequest):
                 conn.commit()
                 conn.close()
             except Exception as db_err:
-                print(f"⚠️ [DATABASE ERROR] Failed to record transaction: {db_err}")
+                print(f"⚠️ [DATABASE ERROR] {db_err}")
 
-            # Ensure all traces are sent to cloud before closure
+            # 📺 PACKAGE PAYLOAD FOR STREAM & CACHE
+            response_payload = {
+                'token': final_sanitized_ui_response,
+                'card_type': detected_card_type,
+                'card_payload': detected_card_payload
+            }
+
+            if cache_eligible:
+                GENERAL_RESPONSE_CACHE[q_hash] = response_payload
+
             langfuse.flush()
-
-            # 📺 YIELD TO UI: SSE SSE format for Streamlit consumption
-            yield f"data: {json.dumps({'token': final_sanitized_ui_response})}\n\n"
-            
-            # Clean terminal audit entry
-            print(f"[AUDIT] Ingress: {redact_pii(user_raw_input)} | Egress: {redact_pii(final_sanitized_ui_response)}")
+            yield f"data: {json.dumps(response_payload)}\n\n"
+            print(f"[AUDIT] {redact_pii(user_raw_input)} -> {redact_pii(final_sanitized_ui_response)} [UI: {detected_card_type}]")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -316,7 +312,6 @@ def get_session_history(session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # Start production gateway
     print("🚀 PRODUCTION OBSERVABILITY GATEWAY STARTING ON http://0.0.0.0:8000")
     print(f"📍 TARGET DATABASE: {DB_PATH}")
     uvicorn.run(app, host="0.0.0.0", port=8000)

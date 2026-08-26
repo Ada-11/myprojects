@@ -3,7 +3,8 @@ import sys
 import json
 import sqlite3
 import asyncio
-from typing import Literal, TypedDict, List
+from datetime import datetime
+from typing import Literal, TypedDict, List, Optional
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
@@ -15,9 +16,8 @@ from langfuse import Langfuse
 langfuse = Langfuse()
 
 ACTIVE_MODEL = "openai/gpt-oss-20b"
-# Use absolute path for K8s, relative for local
 DB_PATH = "/app/coverage-chatbot-api/coverage.db"
-if not os.path.exists("/app"):
+if not os.path.exists(DB_PATH):
     DB_PATH = "coverage-chatbot-api/coverage.db"
 
 from mcp import ClientSession, StdioServerParameters
@@ -33,6 +33,8 @@ class AgentGraphState(TypedDict):
     user_query: str
     final_output: str
     session_id: str 
+    card_type: Optional[str]
+    card_payload: Optional[dict]
 
 class RouteDecision(BaseModel):
     intent_classification: Literal["coverage", "claims", "enrollment"]
@@ -106,74 +108,92 @@ async def coverage_specialist_node(state: AgentGraphState) -> dict:
         query = state["user_query"].lower()
         history, history_plan = load_session_history_and_plan(state["session_id"])
         
-        # PLAN IDENTIFICATION LOGIC
-        p_id = "P101" # Default
-        if "silver" in query or "p102" in query or "silver" in history_plan.lower():
+        p_id = None
+        if "silver" in query or "p102" in query:
             p_id = "P102"
-        elif "gold" in query or "p101" in query or "gold" in history_plan.lower():
+        elif "gold" in query or "p101" in query:
             p_id = "P101"
+        else:
+            p_id = "P101" if "gold" in history_plan.lower() else "P102" if "silver" in history_plan.lower() else "P101"
 
-        # PROCEDURE IDENTIFICATION
-        proc = "general coverage"
-        if "deductible" in query: proc = "deductible"
-        elif "copay" in query: proc = "copay"
-        elif "mri" in query: proc = "mri scan"
-        elif "cosmetic" in query: proc = "cosmetic procedure"
-        elif "physical therapy" in query: proc = "physical therapy"
-
-        # Step 1: Tool Call to the MCP Database
+        proc = "deductible" if "deductible" in query else "general coverage"
         mcp_res = await call_mcp_tool("check_coverage", {"plan_id": p_id, "procedure": proc})
         
-        # Step 2: Professional Synthesis
+        ui_card_payload = None
+        try:
+            parsed = json.loads(mcp_res)
+            raw_deductible = parsed.get("annual_deductible_impact", "0").replace("$", "").replace(",", "")
+            ui_card_payload = {
+                "plan_name": parsed.get("verified_plan_name", "Insurance Plan"),
+                "deductible": float(raw_deductible),
+                "copay": parsed.get("member_copay_coinsurance_rate", "N/A"),
+                "covered": "not covered" not in parsed.get("vector_grounded_notes", "").lower()
+            }
+        except: pass
+
         llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
         prompt = [
             {"role": "system", "content": (
-                "You are an Elite Policy Coverage Reporter. Your task is to report the specific data retrieved from tools.\n"
-                f"RETRIEVED TOOL DATA: {mcp_res}\n"
-                "RULES:\n"
-                "1. If the tool data provides a deductible or copay, state it clearly.\n"
-                "2. If the tool says 'is_covered: False' or 'No record', explain that the specific item is not covered or requires manual support.\n"
-                "3. Speak professionally. DO NOT mention tool calls. DO NOT output JSON.\n"
-                "4. Conclude with: 'This is a structural coverage determination. Not medical advice.'"
+                "You are an Elite Policy Reporter. Summarize provided data.\n"
+                "STRIKE FORCE RULE: Talk text only. DO NOT output JSON. DO NOT call tools.\n"
+                f"DATA: {mcp_res}\n"
+                "Conclude with: 'This is a structural coverage determination. Not medical advice.'"
             )},
             *history,
             {"role": "user", "content": state["user_query"]}
         ]
         
-        try:
-            response = llm.invoke(prompt)
-            span.update(output=response.content)
-            return {"final_output": response.content.strip()}
-        except Exception:
-            return {"final_output": f"Based on your policy ({p_id}), the data for {proc} indicates: {mcp_res}. Contact support at 1-800-555-0199 for more details."}
+        response = llm.invoke(prompt)
+        span.update(output=response.content)
+        return {
+            "final_output": response.content.strip(), 
+            "card_type": "coverage", 
+            "card_payload": ui_card_payload
+        }
 
 async def claims_specialist_node(state: AgentGraphState) -> dict:
     with langfuse.start_as_current_observation(name="claims_expert") as span:
         history, _ = load_session_history_and_plan(state["session_id"])
-        
-        # Extract Claim ID
         c_id = "CLM9901"
         if "clm9902" in state["user_query"].lower(): c_id = "CLM9902"
-        elif "clm9903" in state["user_query"].lower(): c_id = "CLM9903"
         
         mcp_res = await call_mcp_tool("get_claim_status", {"claim_id": c_id})
         
+        ui_card_payload = None
+        try:
+            parsed = json.loads(mcp_res)
+            raw_amt = parsed.get("submitted_financial_amount", "0").replace("$", "").replace(",", "")
+            ui_card_payload = {
+                "claim_id": c_id,
+                "status": parsed.get("adjudication_state_status", "pending").lower(),
+                "amount": float(raw_amt),
+                "date": "2026-08-24"
+            }
+        except: pass
+
         llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
         prompt = [
-            {"role": "system", "content": "You are a Claims Adjudication reporter. Summarize the provided claim data. No tool calls or JSON."},
+            {"role": "system", "content": "Claims Expert. Summarize provided data. No JSON. No tools.\n" + f"DATA: {mcp_res}"},
             *history,
-            {"role": "user", "content": state["user_query"]},
-            {"role": "system", "content": f"DATA: {mcp_res}"}
+            {"role": "user", "content": state["user_query"]}
         ]
         response = llm.invoke(prompt)
         span.update(output=response.content)
-        return {"final_output": response.content.strip()}
+        return {
+            "final_output": response.content.strip(), 
+            "card_type": "claim", 
+            "card_payload": ui_card_payload
+        }
 
 async def enrollment_handler_node(state: AgentGraphState) -> dict:
-    with langfuse.start_as_current_observation(name="enrollment_handler") as span:
-        res = "Enrollment inquiries and member ID requests are managed via the secure Corporate HR Portal. Please log in to your dashboard for those updates."
-        span.update(output=res)
-        return {"final_output": res}
+    # UPDATED PHRASE BELOW:
+    new_phrase = "Enrollment inquiries and member ID requests are managed via the official secure HR Portal. Please log in to your dashboard to complete these updates."
+    
+    return {
+        "final_output": new_phrase, 
+        "card_type": None, 
+        "card_payload": None
+    }
 
 # --- ASSEMBLE ---
 workflow_graph = StateGraph(AgentGraphState)
@@ -187,11 +207,3 @@ workflow_graph.add_edge("CoverageSpecialist", END)
 workflow_graph.add_edge("ClaimsSpecialist", END)
 workflow_graph.add_edge("EnrollmentHandler", END)
 multi_agent_application_mesh = workflow_graph.compile()
-
-if __name__ == "__main__":
-    async def run():
-        print("🕸️ MULTI-AGENT STATE GRAPH CLI")
-        res = await multi_agent_application_mesh.ainvoke({"user_query": "Deductible for gold?", "session_id": "CLI"})
-        print(f"AI: {res['final_output']}")
-        langfuse.flush()
-    asyncio.run(run())

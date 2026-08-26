@@ -66,9 +66,17 @@ def check_output_guardrail(response_text: str) -> str:
     clean_response = sanitized.lower()
     
     # Catch clinical advice steering keywords
+    # FIXED: Removed "medical advice" from this list to prevent self-triggering 
+    # when the model includes its mandatory disclaimer.
     medical_advice_indicators = [
-        "you should take", "your condition is", "diagnose", "treat this symptom",
-        "take this medication", "suggest some possible steps", "medical advice"
+        "you should take", 
+        "your condition is", 
+        "diagnose", 
+        "treat this symptom",
+        "take this medication", 
+        "suggest some possible steps",
+        "you are suffering from",
+        "prescription for"
     ]
     
     for keyword in medical_advice_indicators:
@@ -82,6 +90,7 @@ def check_output_guardrail(response_text: str) -> str:
             )
             
     return sanitized
+
 # ----------------------------------------------------------------------
 # LOCAL COMBINED PERIMETER GATE TESTER
 # ----------------------------------------------------------------------
@@ -103,13 +112,12 @@ if __name__ == "__main__":
     # Validate Output Perimeter
     print("\n[TESTING OUTBOUND GATEWAY]")
     output_tests = [
-        ("Your claim is processing normally.", "Your claim is processing normally."),
-        ("Based on your chart, you have cancer. Take this medication.", "⚠️ Notice: As an AI insurance assistant, I am strictly forbidden from providing clinical or diagnostic medical advice. Please consult with a licensed physician immediately regarding your symptoms or treatments.")
+        ("Your claim is processing normally. This is not medical advice.", "Your claim is processing normally. This is not medical advice."),
+        ("Based on your chart, you have cancer. Take this medication.", "⚠️ Notice: As an AI health insurance assistant, I am strictly authorized to provide coverage details...")
     ]
     for raw_out, expected_out in output_tests:
         match = "MATCH" if check_output_guardrail(raw_out)[:30] == expected_out[:30] else "MISMATCH"
         print(f"-> Output Filter Test: {match}")
-
 ```
 
 ## File: ./tool_calling_chatbot.py
@@ -123,436 +131,72 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field, ValidationError
 from groq import Groq
 import tiktoken
+from dotenv import load_dotenv
+
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+DB_PATH_GLOBAL = "/app/coverage-chatbot-api/coverage.db"
+if not os.path.exists(DB_PATH_GLOBAL):
+    DB_PATH_GLOBAL = "coverage-chatbot-api/coverage.db"
+
+ACTIVE_MODEL = "openai/gpt-oss-20b"
 
 # ---------------------------------------------------------
-# 1. PYDANTIC OUTPUT DATA SCHEMAS FOR STRICT VALIDATION
+# 1. MODELS & DATA (PRODUCED BY THE DB)
 # ---------------------------------------------------------
 class CoverageValidationModel(BaseModel):
-    plan_id: str = Field(..., min_length=2)
-    procedure: str = Field(..., min_length=3)
-    is_covered: bool
-    limitations: str
-    pre_authorization_required: bool
+    plan_id: str; procedure: str; is_covered: bool; limitations: str; pre_authorization_required: bool
 
 class ClaimStatusValidationModel(BaseModel):
-    claim_id: str = Field(..., min_length=4)
-    status: str = Field(..., pattern="^(paid|denied|pending_review)$")
-    submitted_amount: float = Field(..., ge=0.0)
-    allowed_amount: Optional[float] = Field(None, ge=0.0)
-    member_responsibility: Optional[float] = Field(None, ge=0.0)
-    insurance_paid: Optional[float] = Field(None, ge=0.0)
-    denial_reason: Optional[str] = None
+    claim_id: str; status: str; submitted_amount: float; allowed_amount: Optional[float]; insurance_paid: Optional[float]
 
-class PlanDetailsValidationModel(BaseModel):
-    plan_id: str = Field(..., min_length=2)
-    plan_name: str
-    monthly_premium: float = Field(..., ge=0.0)
-    annual_deductible: float = Field(..., ge=0.0)
-    copay_pct: int = Field(..., ge=0, le=100)
-    out_of_pocket_maximum: float = Field(..., ge=0.0)
-    network_tier: str
-
-class OutOfPocketValidationModel(BaseModel):
-    procedure: str
-    plan_id: str
-    average_allowed_cost: float = Field(..., ge=0.0)
-    estimated_member_deductible_impact: float = Field(..., ge=0.0)
-    estimated_coinsurance_payment: float = Field(..., ge=0.0)
-    total_estimated_out_of_pocket: float = Field(..., ge=0.0)
-
-# ---------------------------------------------------------
-# 2. MOCK DATASETS
-# ---------------------------------------------------------
+# EXTENDED MOCK DATA to handle more keywords
 MOCK_COVERAGE = [
-    {"plan_id": "P101", "procedure": "physical therapy", "is_covered": True, "limitations": "Covered up to 20 visits per calendar year.", "pre_authorization_required": False},
-    {"plan_id": "P102", "procedure": "acupuncture", "is_covered": False, "limitations": "Explicitly categorized under plan policy exclusions.", "pre_authorization_required": False},
-    {"plan_id": "P101", "procedure": "mri scan", "is_covered": True, "limitations": "Subject to annual deductible constraints.", "pre_authorization_required": True}
-]
-
-MOCK_CLAIMS = [
-    {"claim_id": "CLM9901", "status": "paid", "submitted_amount": 450.00, "allowed_amount": 350.00, "member_responsibility": 35.00, "insurance_paid": 315.00, "denial_reason": None},
-    {"claim_id": "CLM9902", "status": "denied", "submitted_amount": 1200.00, "allowed_amount": 0.00, "member_responsibility": 1200.00, "insurance_paid": 0.00, "denial_reason": "Missing required pre-authorization reference code."},
-    {"claim_id": "CLM9903", "status": "pending_review", "submitted_amount": 150.00, "allowed_amount": None, "member_responsibility": None, "insurance_paid": None, "denial_reason": None}
-]
-
-MOCK_PLANS = [
-    {"plan_id": "P101", "plan_name": "Gold PPO", "monthly_premium": 500.00, "annual_deductible": 2000.00, "copay_pct": 10, "out_of_pocket_maximum": 4000.00, "network_tier": "GOLD"},
-    {"plan_id": "P102", "plan_name": "Silver HMO", "monthly_premium": 300.00, "annual_deductible": 1500.00, "copay_pct": 20, "out_of_pocket_maximum": 5500.00, "network_tier": "SILVER"},
-    {"plan_id": "P103", "plan_name": "Bronze HMO", "monthly_premium": 150.00, "annual_deductible": 1000.00, "copay_pct": 30, "out_of_pocket_maximum": 7000.00, "network_tier": "BRONZE"}
-]
-
-MOCK_OUT_OF_POCKET = [
-    {"procedure": "knee surgery", "plan_id": "P101", "average_allowed_cost": 5000.00, "estimated_member_deductible_impact": 2000.00, "estimated_coinsurance_payment": 300.00, "total_estimated_out_of_pocket": 2300.00},
-    {"procedure": "routine evaluation", "plan_id": "P102", "average_allowed_cost": 150.00, "estimated_member_deductible_impact": 0.00, "estimated_coinsurance_payment": 30.00, "total_estimated_out_of_pocket": 30.00}
+    {"plan_id": "P101", "procedure": "deductible", "is_covered": True, "limitations": "$2,000 Annual Individual.", "pre_authorization_required": False},
+    {"plan_id": "P102", "procedure": "deductible", "is_covered": True, "limitations": "$1,500 Annual Individual.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "copay", "is_covered": True, "limitations": "10% Coinsurance.", "pre_authorization_required": False},
+    {"plan_id": "P102", "procedure": "copay", "is_covered": True, "limitations": "20% Coinsurance.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "cosmetic procedure", "is_covered": False, "limitations": "Excluded under Gold policy terms.", "pre_authorization_required": False},
+    {"plan_id": "P101", "procedure": "physical therapy", "is_covered": True, "limitations": "20 visits/year.", "pre_authorization_required": False}
 ]
 
 # ---------------------------------------------------------
-# 3. PYTHON REALIZATION FUNCTIONS WITH INLINE PYDANTIC VALIDATION
+# 2. RUNTIME
 # ---------------------------------------------------------
-def check_coverage(plan_id: str, procedure: str) -> str:
-    p_clean = procedure.strip().lower()
-    raw_match = None
-    for item in MOCK_COVERAGE:
-        if item["plan_id"].upper() == plan_id.strip().upper() and item["procedure"] == p_clean:
-            raw_match = item
-            break
-            
-    if not raw_match:
-        raw_match = {"plan_id": plan_id, "procedure": procedure, "is_covered": False, "limitations": "No record found.", "pre_authorization_required": False}
-        
-    try:
-        validated_data = CoverageValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic structural serialization failure.", "details": ve.errors()})
-
-def get_claim_status(claim_id: str) -> str:
-    raw_match = None
-    for item in MOCK_CLAIMS:
-        if item["claim_id"].upper() == claim_id.strip().upper():
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Claim record matching target string could not be verified."})
-        
-    try:
-        validated_data = ClaimStatusValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-def get_plan_details(plan_id: str) -> str:
-    raw_match = None
-    for item in MOCK_PLANS:
-        if item["plan_id"].upper() == plan_id.strip().upper():
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Invalid plan ID tracking descriptor metadata."})
-        
-    try:
-        validated_data = PlanDetailsValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-def estimate_out_of_pocket_cost(procedure: str, plan_id: str) -> str:
-    p_clean = procedure.strip().lower()
-    raw_match = None
-    for item in MOCK_OUT_OF_POCKET:
-        if item["plan_id"].upper() == plan_id.strip().upper() and item["procedure"] == p_clean:
-            raw_match = item
-            break
-            
-    if not raw_match:
-        return json.dumps({"error": "Custom out-of-pocket projection details unavailable."})
-        
-    try:
-        validated_data = OutOfPocketValidationModel(**raw_match)
-        return validated_data.model_dump_json()
-    except ValidationError as ve:
-        return json.dumps({"error": "Pydantic data validation crash.", "details": ve.errors()})
-
-# ---------------------------------------------------------
-# 4. SCHEMAS FOR GROQ TOOLS ARRAY PARAMETERS
-# ---------------------------------------------------------
-TOOLS_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_coverage",
-            "description": "Checks if a specific medical procedure or treatment is covered under a member's insurance plan ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan_id": {"type": "string", "description": "The insurance plan ID (e.g., 'P101', 'P102')."},
-                    "procedure": {"type": "string", "description": "The medical procedure name (e.g., 'physical therapy')."}
-                },
-                "required": ["plan_id", "procedure"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_claim_status",
-            "description": "Retrieves the current processing state, adjudication status, and payment breakdown for a submitted insurance claim ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "claim_id": {"type": "string", "description": "The unique alphanumeric string identifying the submitted medical claim (e.g., 'CLM9901')."}
-                },
-                "required": ["claim_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_plan_details",
-            "description": "Retrieves core cost-sharing metrics, monthly premiums, and deductible tracking totals for an insurance plan ID.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "plan_id": {"type": "string", "description": "The primary alphanumeric tracking ID of the targeted insurance tier."}
-                },
-                "required": ["plan_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "estimate_out_of_pocket_cost",
-            "description": "Calculates an estimated member cost summary for a procedure based on a plan's specific coinsurance, deductible, and historical reference rates.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "procedure": {"type": "string", "description": "The medical treatment or service name to evaluate (e.g., 'knee surgery')."},
-                    "plan_id": {"type": "string", "description": "The active insurance plan ID to execute calculation metrics against."}
-                },
-                "required": ["procedure", "plan_id"]
-            }
-        }
-    }
-]
-
-# ----------------------------------------------------------------------
-# 4.5 UNIFIED AUTOMATED MEMORY COMPRESSION & TOKEN COUNTING UTILITIES
-# ----------------------------------------------------------------------
-def count_tokens_in_history(messages_list: list, model_name: str = "gpt-3.5-turbo") -> int:
-    """Calculates exact token weight footprint of a message array stack."""
-    try:
-        encoding_engine = tiktoken.encoding_for_model(model_name)
-    except KeyError:
-        encoding_engine = tiktoken.get_encoding("cl100k_base")
-        
-    total_tokens = 0
-    for message in messages_list:
-        total_tokens += 4  
-        total_tokens += len(encoding_engine.encode(message.get("content", "")))
-        total_tokens += len(encoding_engine.encode(message.get("role", "")))
-    total_tokens += 2  
-    return total_tokens
-
-def prune_and_summarize_session_history(session_id: str, db_path: str, groq_client: Groq):
-    """Measures token metrics and condenses oldest 50% of history when threshold is breached."""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT id, role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        all_rows = cursor.fetchall()
-        
-        formatted_messages = [{"role": r, "content": c} for _, r, c in all_rows]
-        token_count_before = count_tokens_in_history(formatted_messages)
-        
-        print(f"\n[TOKEN TELEMETRY] Session: {session_id} | Pre-Check Token Weight: {token_count_before} tokens")
-        
-        # Threshold flag check boundary (~2000 tokens)
-        if token_count_before <= 2000:
-            print(f"[TOKEN TELEMETRY] Status: SAFE ({token_count_before}/2000 tokens). Skipping pruning gate.")
-            conn.close()
-            return
-            
-        print(f"⚠️ [MEMORY CRITICAL] Session {session_id} at {token_count_before} tokens. Compressing thread window...")
-        
-        split_index = len(all_rows) // 2
-        rows_to_summarize = all_rows[:split_index]
-        
-        digest_text = ""
-        for _, role, content in rows_to_summarize:
-            digest_text += f"{role.upper()}: {content}\n"
-            
-        summary_prompt = (
-            "You are an internal system log compression daemon engine.\n"
-            "Summarize the conversation transcript below into a single, highly dense, concise paragraph.\n"
-            "Ensure you capture all specified alphanumeric data vectors accurately.\n"
-            "Return ONLY the summary paragraph text with no extra remarks.\n\n"
-            f"Transcript Log to Compress:\n{digest_text}"
-        )
-        
-        summary_response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": summary_prompt}],
-            temperature=0.0
-        )
-        condensed_summary_string = summary_response.choices[0].message.content.strip()
-        
-        row_ids_to_delete = [row for row in rows_to_summarize]
-        cursor.execute(
-            f"DELETE FROM conversations WHERE id IN ({','.join(['?'] * len(row_ids_to_delete))})",
-            row_ids_to_delete
-        )
-        
-        cursor.execute(
-            "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (
-                session_id, 
-                "system", 
-                f"[SYSTEM CONVERSATION SUMMARY OF OLDER TURNS]: {condensed_summary_string}", 
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
-        )
-        conn.commit()
-        
-        cursor.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        updated_rows = cursor.fetchall()
-        conn.close()
-        
-        updated_messages = [{"role": r, "content": c} for r, c in updated_rows]
-        token_count_after = count_tokens_in_history(updated_messages)
-        
-        print(f"✅ [MEMORY OPTIMIZED] Summarization complete for Session: {session_id}")
-        print(f"[TOKEN TELEMETRY] Post-Compression Token Weight: {token_count_after} tokens (Saved: {token_count_before - token_count_after} tokens)\n")
-        
-    except Exception as e:
-        print(f"[WARN] Memory compression thread experienced an exception: {str(e)}")
-
-# ----------------------------------------------------------------------
-# 5. AGENT INTERACTIVE RUNTIME MULTI-TURN PIPELINE WITH HISTORY INJECTION
-# ----------------------------------------------------------------------
 def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True, session_id: str = "DEFAULT-SESS"):
-    """Executes agent loop using token-streaming and pulls last 10 messages from absolute SQLite path."""
-    api_key_env = os.environ.get("GROQ_API_KEY")
-    if not api_key_env:
-        yield f"data: {json.dumps({'error': 'Missing internal platform credentials'})}\n\n"
-        return
+    with langfuse.start_as_current_observation(name="llm_agent_run", input=user_query, metadata={"session_id": session_id}) as generation:
+        api_key = os.environ.get("GROQ_API_KEY")
+        client = Groq(api_key=api_key)
+        
+        messages = [
+            {"role": "system", "content": "You are a professional Health Insurance Navigator. No medical advice. Talk text only."},
+            {"role": "user", "content": user_query}
+        ]
 
-    client = Groq(api_key=api_key_env)
-    
-    # FORCED UNIFIED ABSOLUTE DB DATABASE PATH LAYER
-    db_path = "/Users/ada/myprojects/my-first-app/coverage-chatbot-api/coverage.db"
-
-    # Trigger single pruning evaluation gate check pass before constructing system strings
-    prune_and_summarize_session_history(session_id, db_path, client)
-
-    historical_turns = []
-    remembered_plan_id = "Not Specified Yet"
-    
-    try:
-        if os.path.exists(db_path):
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-                (session_id,)
+        try:
+            response = client.chat.completions.create(model=ACTIVE_MODEL, messages=messages, temperature=0.0)
+            final_text = response.choices[0].message.content
+            
+            generation.update(
+                output=final_text, model=ACTIVE_MODEL,
+                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens}
             )
-            rows = cursor.fetchall()
-            conn.close()
-            
-            for role, content in rows:
-                historical_turns.append({"role": role, "content": content})
-                content_upper = content.upper()
-                if "P101" in content_upper or "GOLD PPO" in content_upper:
-                    remembered_plan_id = "P101 (Gold PPO)"
-                elif "P102" in content_upper or "SILVER HMO" in content_upper:
-                    remembered_plan_id = "P102 (Silver HMO)"
-                elif "P103" in content_upper or "BRONZE HMO" in content_upper:
-                    remembered_plan_id = "P103 (Bronze HMO)"
-    except Exception as db_err:
-        print(f"[WARN] Failed to pull context arrays from SQLite tracking ledger: {str(db_err)}")
 
-    sliding_window_history = historical_turns[-10:] if len(historical_turns) > 10 else historical_turns
+            if stream:
+                yield f"data: {json.dumps({'token': final_text})}\n\n"
+            else:
+                return final_text
 
-    system_prompt = (
-        "You are an advanced health insurance navigation assistant combining structural compliance limits with an accessible, professional tone.\n"
-        "1. ACCURATE AND EMPATHETIC BALANCE: State all tool-returned metrics, deductibles, and coverage statuses with literal precision.\n"
-        "2. MEDICAL DEFLECTION GUARDRAIL: If the user mentions health symptoms, state clearly that you cannot evaluate conditions and direct them to their doctor.\n"
-        "3. TERMINOLOGY GUARDRAIL: Always define 'deductible' in plain language on first use.\n"
-        "4. STANDARD CLOSING DISCLAIMER: Conclude with this exact standalone paragraph: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'\n\n"
-        "----------------------------------------------------------------------\n"
-        "⚙️ TRACKED MEMBER SESSION PARAMETERS (PLAN-MEMORY STORAGE LAYER):\n"
-        f"*   Remembered Insurance Policy Plan ID for Session: {remembered_plan_id}\n"
-        "----------------------------------------------------------------------\n"
-    )
-
-    if external_context:
-        system_prompt += f"\n\nRetrieved RAG Context Layer Material:\n{external_context}"
-
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    for turn in sliding_window_history:
-        messages.append({"role": turn["role"], "content": turn["content"]})
-        
-    messages.append({"role": "user", "content": user_query})
-
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            tools=TOOLS_SCHEMAS,
-            tool_choice="auto",
-            temperature=0.0
-        )
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
-    except Exception as api_err:
-        yield f"data: {json.dumps({'error': f'Inference gateway connection loss: {str(api_err)}'})}\n\n"
-        return
-
-    if tool_calls:
-        messages.append(response_message)
-        available_functions = {
-            "check_coverage": check_coverage,
-            "get_claim_status": get_claim_status,
-            "get_plan_details": get_plan_details,
-            "estimate_out_of_pocket_cost": estimate_out_of_pocket_cost
-        }
-
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
-            
-            if function_name not in available_functions:
-                continue
-                
-            function_to_call = available_functions[function_name]
-            validated_json_string = function_to_call(**function_args)
-
-            messages.append({
-                "tool_call_id": tool_call.id,
-                "role": "tool",
-                "name": function_name,
-                "content": validated_json_string
-            })
-
-    try:
-        completion_stream = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=messages,
-            temperature=0.0,
-            stream=True
-        )
-        
-        for chunk in completion_stream:
-            token_text = chunk.choices[0].delta.content
-            if token_text:
-                payload = {"token": token_text}
-                yield f"data: {json.dumps(payload)}\n\n"
-    except Exception as stream_fault:
-        payload = {"error": f"Mid-stream network exception: {str(stream_fault)}"}
-        yield f"data: {json.dumps(payload)}\n\n"
-
-# ----------------------------------------------------------------------
-# ENDPOINT CONNECTOR MODULE ROUTING GATE
-# ----------------------------------------------------------------------
-def generate_answer(user_query: str, context_block: str = "", session_id: str = "DEFAULT-SESS"):
-    return run_agent_loop(user_query, context_block, stream=True, session_id=session_id)
-
+        except Exception as api_err:
+            generation.update(level="ERROR", status_message=str(api_err))
+            yield f"data: {json.dumps({'error': str(api_err)})}\n\n"
+    langfuse.flush()
 
 if __name__ == "__main__":
-    for sse_line in run_agent_loop("What is my deductible?", session_id="TEST-SESS-001"):
+    for sse_line in run_agent_loop("Is physical therapy covered?", session_id="CLI-STABLE"):
         print(sse_line.strip())
-
 ```
 
 ## File: ./test_harness.py
@@ -823,361 +467,194 @@ from typing import Literal, TypedDict, List
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
-from groq import BadRequestError
+from dotenv import load_dotenv
 
-# Import low-level MCP asynchronous transport clients
+# --- INITIALIZE ---
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+ACTIVE_MODEL = "openai/gpt-oss-20b"
+# Use absolute path for K8s, relative for local
+DB_PATH = "/app/coverage-chatbot-api/coverage.db"
+if not os.path.exists("/app"):
+    DB_PATH = "coverage-chatbot-api/coverage.db"
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 from guardrails_config import check_input_guardrail, check_output_guardrail
-from redact_pii import redact_pii
 
-# Ensure parent directory is accessible for local module resolutions
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from tool_calling_chatbot import (
-    check_coverage as native_check_coverage,
-    get_claim_status as native_get_claim_status
-)
-
-# Define absolute database tracking path matching your Day 20 specifications
-DB_PATH = "/Users/ada/myprojects/my-first-app/coverage-chatbot-api/coverage.db"
-
-# ----------------------------------------------------------------------
-# 1. STATE MANAGEMENT CONTRACT
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 1. STATE & ROUTING CONTRACTS
+# ---------------------------------------------------------
 class AgentGraphState(TypedDict):
-    """Unified state tracking matrix holding message bundles and tracking tags."""
     messages: List[dict]
     next_node: str
     user_query: str
     final_output: str
-    session_id: str  # Injected persistent tracking descriptor key
+    session_id: str 
 
 class RouteDecision(BaseModel):
-    """Structured Pydantic contract enforcing deterministic routing paths."""
     intent_classification: Literal["coverage", "claims", "enrollment"]
     next_action_node: Literal["CoverageSpecialist", "ClaimsSpecialist", "EnrollmentHandler"]
     routing_reasoning: str
 
-# ----------------------------------------------------------------------
-# 2. SQLITE HISTORY EXTRACTION & PLAN MEMORY SINK UTILITY
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 2. UTILITIES
+# ---------------------------------------------------------
 def load_session_history_and_plan(session_id: str) -> tuple:
-    """
-    Connects to the Day 20 SQLite ledger to load the sliding window history 
-    and identify any previously specified plan selections.
-    """
     historical_turns = []
     remembered_plan_id = "Not Specified Yet"
-    
-    if not os.path.exists(DB_PATH):
-        return [], remembered_plan_id
-        
+    if not os.path.exists(DB_PATH): return [], remembered_plan_id
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        
+        cursor.execute("SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC", (session_id,))
+        rows = cursor.fetchall(); conn.close()
         for role, content in rows:
             historical_turns.append({"role": role, "content": content})
-            content_upper = content.upper()
-            if "P101" in content_upper or "GOLD PPO" in content_upper:
-                remembered_plan_id = "P101 (Gold PPO)"
-            elif "P102" in content_upper or "SILVER HMO" in content_upper:
-                remembered_plan_id = "P102 (Silver HMO)"
-            elif "P103" in content_upper or "BRONZE HMO" in content_upper:
-                remembered_plan_id = "P103 (Bronze HMO)"
-    except Exception as e:
-        print(f"[WARN] Failed fetching SQLite history frame: {str(e)}", file=sys.stderr)
-        
-    # Isolate rolling last 10 messages (sliding window) to save context tokens
-    sliding_window = historical_turns[-10:] if len(historical_turns) > 10 else historical_turns
-    return sliding_window, remembered_plan_id
+            c_up = content.upper()
+            if "P101" in c_up or "GOLD" in c_up: remembered_plan_id = "P101 (Gold PPO)"
+            elif "P102" in c_up or "SILVER" in c_up: remembered_plan_id = "P102 (Silver HMO)"
+    except Exception: pass
+    return historical_turns[-10:], remembered_plan_id
 
-# ----------------------------------------------------------------------
-# 3. CHAOS-DEFENDED UNIVERSAL MCP TOOL RUNNER CLIENT LAYER
-# ----------------------------------------------------------------------
 async def call_mcp_tool(tool_name: str, tool_args: dict) -> str:
-    """
-    Asynchronous MCP client with a 10-second timeout, 1-pass retry logic,
-    and a graceful, non-crashing member support deflection fallback wrapper.
-    """
-    server_params = StdioServerParameters(
-        command="python3",
-        args=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")]
-    )
-    
-    # Define our strict production chaos parameters
-    MAX_ATTEMPTS = 2  # Primary attempt + exactly 1 retry
-    TIMEOUT_SECONDS = 10.0
-    CANNED_FALLBACK_RESPONSE = (
-        "⚠️ I'm having trouble accessing that policy database right now. "
-        "Please contact member support directly at 1-800-555-0199 for real-time assistance, "
-        "or try again in a few moments."
-    )
-    
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    with langfuse.start_as_current_observation(name=f"mcp_{tool_name}", input=tool_args) as span:
+        server_params = StdioServerParameters(
+            command=sys.executable, 
+            args=[os.path.join(os.getcwd(), "mcp_server.py")]
+        )
         try:
-            print(f"📡 [MCP CLIENT WIRE] Execution Attempt #{attempt} for tool '{tool_name}'...")
-            
-            # Enforce an explicit execution timeframe cap boundary
-            async with asyncio.timeout(TIMEOUT_SECONDS):
+            async with asyncio.timeout(10.0):
                 async with stdio_client(server_params) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
-                        # Negotiate JSON-RPC parameters
                         await session.initialize()
-                        
-                        # Fire request down the transport channel
                         result = await session.call_tool(tool_name, arguments=tool_args)
-                        
-                        if result and result.content and len(result.content) > 0:
-                            # Return the successful payload instantly, breaking the retry loop
-                            return result.content[0].text
-                            
-                        raise ValueError("Empty or malformed payload returned from protocol server.")
-                        
-        except asyncio.TimeoutError:
-            print(f"⏳ [TIMEOUT BREACH] Attempt #{attempt} exceeded the {TIMEOUT_SECONDS}s window threshold limit.", file=sys.stderr)
+                        output = result.content[0].text if result and result.content else "No Data Found"
+                        span.update(output=output)
+                        return output
         except Exception as e:
-            print(f"💥 [TOOL RUNTIME CRASH] Attempt #{attempt} encountered an exception error: {str(e)}", file=sys.stderr)
-            
-        # Give the sub-process engine a micro-pause to settle before firing a retry pass
-        if attempt < MAX_ATTEMPTS:
-            await asyncio.sleep(0.5)
+            span.update(level="ERROR", status_message=str(e))
+            return "⚠️ Database connectivity error."
 
-    # 🛑 OVERFLOW GATE: If both attempts are exhausted, intercept the failure gracefully
-    print("🛡️ [CHAOS DEFENSE ACTIVATED] Tool chain exhausted. Deflecting to user-friendly canned support message.")
-    return CANNED_FALLBACK_RESPONSE
-
-# ----------------------------------------------------------------------
-# 4. MEMORY-GROUNDED AGENT GRAPH NODES
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------
+# 3. NODES
+# ---------------------------------------------------------
 async def router_node(state: AgentGraphState) -> dict:
-    """
-    Supervisor Router: Classifies user intent and sets the target lane.
-    Hardened with a try/except closure to catch adversarial tool-use validation crashes.
-    """
-    print("\n" + "="*15 + " 🔀 NODE 1: SUPERVISOR ROUTER " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    structured_router = llm.with_structured_output(RouteDecision)
-    
-    system_prompt = (
-        "Analyze the query and pick the single best specialist agent node.\n"
-        "MAPPING RULES:\n"
-        "1. Policy rules, inclusions, visit limits -> route to 'CoverageSpecialist'.\n"
-        "2. Claims state, paid amounts, denials, billing -> route to 'ClaimsSpecialist'.\n"
-        "3. Premium costs, HR setup, enrollments -> route to 'EnrollmentHandler'."
-    )
-    user_query_text = state.get("user_query", "")
-    
-    try:
-        # Attempt standard structured classification
-        routing_result: RouteDecision = structured_router.invoke(f"{system_prompt}\n\nUser Query: {user_query_text}")
-        print(f"▶ Target Specialist Selected: `{routing_result.next_action_node}`")
-        return {"next_node": routing_result.next_action_node}
+    with langfuse.start_as_current_observation(name="supervisor_router", input=state["user_query"]) as span:
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        structured_router = llm.with_structured_output(RouteDecision)
         
-    except BadRequestError as groq_err:
-        # 🛡️ THE EXCEPTION SHIELD: Catch malicious schema evasion attacks
-        print(f"🚨 [ADVERSARIAL HIJACK DETECTED] Groq tool-use validation failed: {str(groq_err)}", file=sys.stderr)
+        prompt = (
+            "You are a routing supervisor. Categorize the query:\n"
+            "1. Deductibles, copays, coverage limits, specific procedure costs -> 'CoverageSpecialist'\n"
+            "2. Claims, payments, CLM IDs, denial reasons -> 'ClaimsSpecialist'\n"
+            "3. Enrollment, portals, HR, member IDs -> 'EnrollmentHandler'\n"
+            f"User Query: {state['user_query']}"
+        )
         
-        # Override the routing target and send the state to the EnrollmentHandler node 
-        # to prevent script failure and provide a safe error message
-        return {"next_node": "EnrollmentHandler"}
+        try:
+            decision = structured_router.invoke(prompt)
+            span.update(output=decision.next_action_node)
+            return {"next_node": decision.next_action_node}
+        except:
+            return {"next_node": "EnrollmentHandler"}
 
 async def coverage_specialist_node(state: AgentGraphState) -> dict:
-    """Agent 2: Coverage Specialist utilizing memory and live MCP tools."""
-    print("\n" + "="*15 + " 🛡️ NODE 2: POLICY COVERAGE EXPERT " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    user_query_text = state.get("user_query", "")
-    
-    # Read history to find plan_id if omitted in the current user prompt turn
-    history, remembered_plan_id = load_session_history_and_plan(state.get("session_id", "DEFAULT-SESS"))
-    
-    plan_id = "P101" # Default fallback
-    if "p102" in remembered_plan_id.lower() or "p102" in user_query_text.lower(): plan_id = "P102"
-    elif "p103" in remembered_plan_id.lower() or "p103" in user_query_text.lower(): plan_id = "P103"
-    elif "p101" in remembered_plan_id.lower() or "p101" in user_query_text.lower(): plan_id = "P101"
-    
-    procedure = "physical therapy"
-    if "acupuncture" in user_query_text.lower(): procedure = "acupuncture"
-    elif "mri" in user_query_text.lower(): procedure = "mri scan"
-    
-    print(f"[CONTEXT EXECUTION] Evaluated Plan Context: {plan_id} (Resolved from memory storage layer)")
-    mcp_response_json = await call_mcp_tool("check_coverage", {"plan_id": plan_id, "procedure": procedure})
-    
-    instruction_prompt = (
-        "Context: You are an elite Health Insurance Policy Coverage Specialist.\n"
-        f"Remembered Session Plan ID context: {plan_id}\n"
-        "Instruction: Summarize procedure coverage rules accurately from the tool data.\n"
-        "Conclude with this exact disclaimer: 'This is a structural coverage determination based on exact policy terms. This is not medical advice.'"
-    )
-    
-    # Construct complete prompt compiling sliding conversation turns
-    prompt_messages = [{"role": "system", "content": instruction_prompt}]
-    for turn in history:
-        prompt_messages.append({"role": turn["role"], "content": turn["content"]})
-    prompt_messages.append({"role": "user", "content": user_query_text})
-    prompt_messages.append({"role": "system", "content": f"Live MCP Server Output Result:\n{mcp_response_json}"})
-    
-    response = llm.invoke(prompt_messages)
-    return {"final_output": response.content.strip()}
+    with langfuse.start_as_current_observation(name="coverage_expert") as span:
+        query = state["user_query"].lower()
+        history, history_plan = load_session_history_and_plan(state["session_id"])
+        
+        # PLAN IDENTIFICATION LOGIC
+        p_id = "P101" # Default
+        if "silver" in query or "p102" in query or "silver" in history_plan.lower():
+            p_id = "P102"
+        elif "gold" in query or "p101" in query or "gold" in history_plan.lower():
+            p_id = "P101"
+
+        # PROCEDURE IDENTIFICATION
+        proc = "general coverage"
+        if "deductible" in query: proc = "deductible"
+        elif "copay" in query: proc = "copay"
+        elif "mri" in query: proc = "mri scan"
+        elif "cosmetic" in query: proc = "cosmetic procedure"
+        elif "physical therapy" in query: proc = "physical therapy"
+
+        # Step 1: Tool Call to the MCP Database
+        mcp_res = await call_mcp_tool("check_coverage", {"plan_id": p_id, "procedure": proc})
+        
+        # Step 2: Professional Synthesis
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        prompt = [
+            {"role": "system", "content": (
+                "You are an Elite Policy Coverage Reporter. Your task is to report the specific data retrieved from tools.\n"
+                f"RETRIEVED TOOL DATA: {mcp_res}\n"
+                "RULES:\n"
+                "1. If the tool data provides a deductible or copay, state it clearly.\n"
+                "2. If the tool says 'is_covered: False' or 'No record', explain that the specific item is not covered or requires manual support.\n"
+                "3. Speak professionally. DO NOT mention tool calls. DO NOT output JSON.\n"
+                "4. Conclude with: 'This is a structural coverage determination. Not medical advice.'"
+            )},
+            *history,
+            {"role": "user", "content": state["user_query"]}
+        ]
+        
+        try:
+            response = llm.invoke(prompt)
+            span.update(output=response.content)
+            return {"final_output": response.content.strip()}
+        except Exception:
+            return {"final_output": f"Based on your policy ({p_id}), the data for {proc} indicates: {mcp_res}. Contact support at 1-800-555-0199 for more details."}
 
 async def claims_specialist_node(state: AgentGraphState) -> dict:
-    """Agent 3: Claims Specialist node utilizing conversation memory logs."""
-    print("\n" + "="*15 + " 📄 NODE 3: CLAIMS ADJUDICATION EXPERT " + "="*15)
-    groq_api_token = os.environ.get("GROQ_API_KEY")
-    llm = ChatGroq(groq_api_key=groq_api_token, model_name="llama-3.1-8b-instant", temperature=0.0)
-    user_query_text = state.get("user_query", "")
-    
-    history, _ = load_session_history_and_plan(state.get("session_id", "DEFAULT-SESS"))
-    
-    claim_id = "CLM9901"
-    if "clm9902" in user_query_text.lower(): claim_id = "CLM9902"
-    elif "clm9903" in user_query_text.lower(): claim_id = "CLM9903"
-    
-    mcp_response_json = await call_mcp_tool("get_claim_status", {"claim_id": claim_id})
-    
-    instruction_prompt = (
-        "Context: You are an expert Health Insurance Claims Adjudication Specialist.\n"
-        "Instruction: Report the processing status, financial tracking, and denials with literal precision."
-    )
-    
-    prompt_messages = [{"role": "system", "content": instruction_prompt}]
-    for turn in history:
-        prompt_messages.append({"role": turn["role"], "content": turn["content"]})
-    prompt_messages.append({"role": "user", "content": user_query_text})
-    prompt_messages.append({"role": "system", "content": f"Live MCP Server Output Result:\n{mcp_response_json}"})
-    
-    response = llm.invoke(prompt_messages)
-    return {"final_output": response.content.strip()}
+    with langfuse.start_as_current_observation(name="claims_expert") as span:
+        history, _ = load_session_history_and_plan(state["session_id"])
+        
+        # Extract Claim ID
+        c_id = "CLM9901"
+        if "clm9902" in state["user_query"].lower(): c_id = "CLM9902"
+        elif "clm9903" in state["user_query"].lower(): c_id = "CLM9903"
+        
+        mcp_res = await call_mcp_tool("get_claim_status", {"claim_id": c_id})
+        
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        prompt = [
+            {"role": "system", "content": "You are a Claims Adjudication reporter. Summarize the provided claim data. No tool calls or JSON."},
+            *history,
+            {"role": "user", "content": state["user_query"]},
+            {"role": "system", "content": f"DATA: {mcp_res}"}
+        ]
+        response = llm.invoke(prompt)
+        span.update(output=response.content)
+        return {"final_output": response.content.strip()}
 
 async def enrollment_handler_node(state: AgentGraphState) -> dict:
-    """Agent 4: Enrollment and General Corporate Inquiries Fallback Handler."""
-    print("\n" + "="*15 + " 📋 NODE 4: ENROLLMENT GATEWAY HANDLER " + "="*15)
-    
-    query = state.get("user_query", "").lower()
-    
-    # Check if the query is an off-topic request passed down by the router
-    if "gaming pc" in query or "pc assembly" in query or "marketing description" in query:
-        return {"final_output": "Our insurance assistant handles benefit coverage rules and claims lookups only. For corporate marketing requests, please reference our separate public web portals."}
-        
-    return {"final_output": "Enrollment inquiries and premium schedules are managed securely via our separate Corporate HR gateway portal."}
+    with langfuse.start_as_current_observation(name="enrollment_handler") as span:
+        res = "Enrollment inquiries and member ID requests are managed via the secure Corporate HR Portal. Please log in to your dashboard for those updates."
+        span.update(output=res)
+        return {"final_output": res}
 
-# ----------------------------------------------------------------------
-# 5. ASSEMBLE GRAPH WORKFLOW MATRIX
-# ----------------------------------------------------------------------
+# --- ASSEMBLE ---
 workflow_graph = StateGraph(AgentGraphState)
 workflow_graph.add_node("SupervisorRouter", router_node)
 workflow_graph.add_node("CoverageSpecialist", coverage_specialist_node)
 workflow_graph.add_node("ClaimsSpecialist", claims_specialist_node)
 workflow_graph.add_node("EnrollmentHandler", enrollment_handler_node)
-
 workflow_graph.add_edge(START, "SupervisorRouter")
-workflow_graph.add_conditional_edges(
-    "SupervisorRouter",
-    lambda state: state.get("next_node", "EnrollmentHandler"),
-    {
-        "CoverageSpecialist": "CoverageSpecialist",
-        "ClaimsSpecialist": "ClaimsSpecialist",
-        "EnrollmentHandler": "EnrollmentHandler"
-    }
-)
+workflow_graph.add_conditional_edges("SupervisorRouter", lambda s: s["next_node"])
 workflow_graph.add_edge("CoverageSpecialist", END)
 workflow_graph.add_edge("ClaimsSpecialist", END)
 workflow_graph.add_edge("EnrollmentHandler", END)
-
 multi_agent_application_mesh = workflow_graph.compile()
 
-# ----------------------------------------------------------------------
-# ASYNCHRONOUS CONSOLE LOOP RUNNER BLOCK
-# ----------------------------------------------------------------------
-async def main_async_loop():
-    print("=" * 60)
-    print("🕸️ HARDENED MCP MULTI-AGENT STATE GRAPH ACTIVE")
-    print("Type your insurance question and press Enter. Type 'exit' to quit.")
-    print("=" * 60)
-    
-    SESSION_ID_TAG = "CHAT-PERSIST-99"
-
-    while True:
-        try:
-            user_input = await asyncio.to_thread(input, "\nYou: ")
-            user_input = user_input.strip()
-            if not user_input or user_input.lower() in ["exit", "quit", "q"]:
-                break
-                
-            # 🔒 SECURITY BLOCK 1: CHECK INBOUND GUARDRAILS IMMEDIATELY
-            if not check_input_guardrail(user_input):
-                print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
-                print("⚠️ Security Access Exception: Malicious, off-topic, or unauthorized data access prompt signature detected.")
-                print("="*60 + "\n")
-                continue # Skip processing and reset the loop for the next question
-
-            # Save raw incoming user query to SQLite history tables safely
-            try:
-                from datetime import datetime, timezone
-                import sqlite3
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                    (SESSION_ID_TAG, "user", user_input, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-
-            initial_state: AgentGraphState = {
-                "user_query": user_input,
-                "messages": [],
-                "next_node": "",
-                "final_output": "",
-                "session_id": SESSION_ID_TAG
-            }
-            
-            # Execute the graph workflow safely
-            final_computed_state = await multi_agent_application_mesh.ainvoke(initial_state)
-            ans = final_computed_state.get("final_output", "Error processing.")
-            
-            # 🔒 SECURITY BLOCK 2: CHECK OUTBOUND GUARDRAILS ON GENERATED ANSWER
-            ans = check_output_guardrail(ans)
-            
-            # Save assistant's safe answer down to disk logs
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-                    (SESSION_ID_TAG, "assistant", ans, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-                )
-                conn.commit()
-                conn.close()
-            except Exception:
-                pass
-            
-            # 🔒 SECURITY BLOCK 3: ANONYMIZE TRANSCRIPTS FOR REPOSITORY LOGS ONLY
-            safe_log_prompt = redact_pii(user_input)
-            safe_log_response = redact_pii(ans)
-            print(f"\n[AUDIT LOG ENTRY] User: {safe_log_prompt} | Assistant: {safe_log_response}")
-            
-            print("\n" + "="*15 + " FINAL AGENT ANSWER SYSTEM OUTPUT " + "="*15)
-            print(ans)
-            print("="*60 + "\n")
-            
-        except KeyboardInterrupt:
-            break
-
 if __name__ == "__main__":
-    asyncio.run(main_async_loop())
+    async def run():
+        print("🕸️ MULTI-AGENT STATE GRAPH CLI")
+        res = await multi_agent_application_mesh.ainvoke({"user_query": "Deductible for gold?", "session_id": "CLI"})
+        print(f"AI: {res['final_output']}")
+        langfuse.flush()
+    asyncio.run(run())
 ```
 
 ## File: ./query_chroma_filtered.py
@@ -1767,7 +1244,7 @@ import streamlit as st
 # Import the structural Pydantic card schemas from your project module
 from response_cards import ClaimStatusCard, CoverageSummaryCard
 
-BACKEND_URL = "http://localhost:8000/chat"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000/chat")
 
 st.set_page_config(page_title="Member Dashboard", layout="wide")
 
@@ -1921,6 +1398,63 @@ if user_message := st.chat_input("Ask about a claim or coverage rules (e.g., 'Wh
         except Exception as e:
             st.error(f"Failed to communicate with API server: {str(e)}")
 
+```
+
+## File: ./mut_m_agent.py
+```python
+import os
+import asyncio
+from typing import Literal, TypedDict, List
+from pydantic import BaseModel
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langfuse import Langfuse
+from dotenv import load_dotenv
+
+load_dotenv()
+langfuse = Langfuse()
+ACTIVE_MODEL = "openai/gpt-oss-20b"
+
+class AgentGraphState(TypedDict):
+    user_query: str; next_node: str; final_output: str; session_id: str 
+
+class RouteDecision(BaseModel):
+    next_action_node: Literal["CoverageSpecialist", "EnrollmentHandler"]
+
+async def router_node(state: AgentGraphState) -> dict:
+    with langfuse.start_as_current_observation(name="node_router", input=state["user_query"]) as span:
+        llm = ChatGroq(model_name=ACTIVE_MODEL, temperature=0.0)
+        # In a real scenario, LLM would decide. Here we route to Coverage for test.
+        decision = "CoverageSpecialist"
+        span.update(output=decision)
+        return {"next_node": decision}
+
+async def coverage_specialist_node(state: AgentGraphState) -> dict:
+    with langfuse.start_as_current_observation(name="node_coverage") as span:
+        res = "Your P101 plan covers this visit. This is not medical advice."
+        span.update(output=res)
+        return {"final_output": res}
+
+async def enrollment_handler_node(state: AgentGraphState) -> dict:
+    return {"final_output": "Please contact HR."}
+
+workflow_graph = StateGraph(AgentGraphState)
+workflow_graph.add_node("SupervisorRouter", router_node)
+workflow_graph.add_node("CoverageSpecialist", coverage_specialist_node)
+workflow_graph.add_node("EnrollmentHandler", enrollment_handler_node)
+workflow_graph.add_edge(START, "SupervisorRouter")
+workflow_graph.add_conditional_edges("SupervisorRouter", lambda s: s["next_node"])
+workflow_graph.add_edge("CoverageSpecialist", END)
+workflow_graph.add_edge("EnrollmentHandler", END)
+
+multi_agent_application_mesh = workflow_graph.compile()
+
+if __name__ == "__main__":
+    async def run():
+        res = await multi_agent_application_mesh.ainvoke({"user_query": "Hello", "session_id": "CLI-TEST"})
+        print(f"AI: {res['final_output']}")
+        langfuse.flush()
+    asyncio.run(run())
 ```
 
 ## File: ./chatbot.py
@@ -2713,6 +2247,716 @@ if __name__ == "__main__":
     sample_text = "Hello, please check my insurance policy parameters for plan P101."
     tokens = count_tokens(sample_text)
     print(f"🧮 Integer Token Length: {tokens} tokens")
+```
+
+## File: ./main.py
+```python
+"""
+Main FastAPI Gateway for Agentic Health Insurance Chatbot.
+Handles SSE Streaming, Rate Limiting, SHA-256 Caching, 
+Observability (Langfuse v4), and SQLite Persistence.
+"""
+
+import sys
+import os
+import time
+import json
+import sqlite3
+import hashlib
+import urllib.request
+import urllib.error
+import asyncio
+from datetime import datetime, timezone
+from typing import Any, List, Optional, Literal, TypedDict
+from collections import defaultdict
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+# --- INITIALIZE ENVIRONMENT & OBSERVABILITY ---
+load_dotenv()
+from langfuse import Langfuse
+# Initialize the manual client for SDK v4 compatibility
+# This ensures stability on Mac and within Kubernetes containers
+langfuse = Langfuse()
+
+# --- PROJECT MODULE IMPORTS ---
+# These must exist in your root directory or PYTHONPATH
+from retrieval_engine import retrieve
+from redact_pii import redact_pii
+from guardrails_config import check_input_guardrail, check_output_guardrail
+from token_utils import count_tokens
+
+app = FastAPI(
+    title="Insurance Agent API",
+    description="Production-grade API for health insurance policy navigation."
+)
+
+# ---------------------------------------------------------
+# 1. DATABASE INITIALIZATION: SQLITE STORAGE ENGINE
+# ---------------------------------------------------------
+# Configuration: Absolute path for Kubernetes volume mounts
+DB_PATH = "/app/coverage-chatbot-api/coverage.db"
+
+# Fallback for local Mac development if the /app directory does not exist
+if not os.path.exists("/app"):
+    DB_PATH = "coverage-chatbot-api/coverage.db"
+
+def init_db():
+    """
+    Initializes the database schema for structural conversation history 
+    and detailed token/cost usage tracking.
+    """
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Table for long-term chat history and session persistence
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    
+    # Table for observability analytics and financial auditing
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# Provision database on server initialization
+init_db()
+
+# ---------------------------------------------------------
+# 2. REQUEST MODELS, RATE LIMITING & CACHING
+# ---------------------------------------------------------
+class ChatRequest(BaseModel):
+    session_id: str
+    member_id: str
+    message: str
+
+# Global rate limiting thresholds (Max 5 requests per 60 seconds per session)
+RATE_LIMIT_CEILING = 5
+RATE_LIMIT_WINDOW = 60.0
+REQUEST_HISTORY_LOG = defaultdict(list)
+
+def is_rate_limited(session_id: str) -> bool:
+    """Checks sliding window request counts for the current session."""
+    current_time = time.time()
+    # Purge old records outside the active 60s window frame
+    REQUEST_HISTORY_LOG[session_id] = [t for t in REQUEST_HISTORY_LOG[session_id] if current_time - t < RATE_LIMIT_WINDOW]
+    
+    if len(REQUEST_HISTORY_LOG[session_id]) >= RATE_LIMIT_CEILING:
+        return True
+        
+    REQUEST_HISTORY_LOG[session_id].append(current_time)
+    return False
+
+# Global In-Memory Exact Match Data Cache
+GENERAL_RESPONSE_CACHE = {}
+
+def get_question_hash(question: str) -> str:
+    """Normalizes the string and computes a secure SHA-256 hex string hash."""
+    normalized = question.lower().strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+def is_eligible_for_caching(question: str) -> bool:
+    """
+    SECURITY FILTER: Determines if a query can be safely cached.
+    Explicitly blocks member-specific questions containing claim or tracking identifiers.
+    """
+    clean_q = question.lower().strip()
+    restricted_identifiers = [
+        "clm", "claim", "member id", "my policy", "my balance", 
+        "status of", "p10", "p11", "em9", "john doe"
+    ]
+    
+    for identifier in restricted_identifiers:
+        if identifier in clean_q:
+            return False
+            
+    return True
+
+def fetch_json(url: str, timeout: int = 10) -> Any:
+    """Standard helper to fetch JSON from external URLs (e.g., for RAG context)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "python-urllib/3"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset(failobj="utf-8")
+            data = resp.read().decode(charset)
+            return json.loads(data)
+    except Exception as e:
+        print(f"[FETCH ERROR] {e}")
+        return None
+
+# ---------------------------------------------------------
+# 3. API ENDPOINTS (Streaming + Observability)
+# ---------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    """Standard RFC-compliant health check for Kubernetes liveness/readiness probes."""
+    return {
+        "status": "healthy", 
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": os.path.exists(DB_PATH)
+    }
+
+@app.post("/chat")
+async def handle_chat_endpoint(payload: ChatRequest):
+    """
+    Main Chat Interface. 
+    Returns a StreamingResponse (SSE) compatible with the Streamlit UI.
+    """
+    
+    async def event_generator():
+        # Start the manual Langfuse Trace for v4 compatibility
+        with langfuse.start_as_current_observation(
+            name="chat_request",
+            metadata={
+                "user_id": payload.member_id,
+                "session_id": payload.session_id,
+                "deployment": "k8s-minikube",
+                "cache_enabled": True
+            }
+        ) as trace:
+            
+            user_raw_input = payload.message
+            
+            # 🔒 RATE LIMIT GATEWAY: Intercept spam attempts
+            if is_rate_limited(payload.session_id):
+                trace.update(status_message="Rate Limit Triggered")
+                yield f"data: {json.dumps({'error': 'Rate limit exceeded. Please wait 60 seconds.'})}\n\n"
+                return
+            
+            # 🔒 SECURITY BLOCK: Check inbound guardrails for injection/PII
+            if not check_input_guardrail(user_raw_input):
+                trace.update(status_message="Inbound Block", output="Security Access Exception")
+                yield f"data: {json.dumps({'error': 'Security Access Exception: Prompt signature blocked.'})}\n\n"
+                return
+
+            # 🚀 CACHE READ HIT: Hashed exact match lookup
+            q_hash = get_question_hash(user_raw_input)
+            cache_eligible = is_eligible_for_caching(user_raw_input)
+            
+            if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
+                cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
+                trace.update(output=cached_reply, metadata={"cache": "hit"})
+                yield f"data: {json.dumps({'token': cached_reply})}\n\n"
+                return
+
+            # 🕸️ AGENT GRAPH EXECUTION SPAN
+            with langfuse.start_as_current_observation(name="agent_graph_execution") as span:
+                try:
+                    # Dynamic import to ensure current graph state
+                    from multi_agent import multi_agent_application_mesh
+                    
+                    initial_state = {
+                        "user_query": user_raw_input,
+                        "session_id": payload.session_id,
+                        "messages": [],
+                        "next_node": "",
+                        "final_output": ""
+                    }
+                    
+                    # Execute the asynchronous graph
+                    computed_final_state = await multi_agent_application_mesh.ainvoke(initial_state)
+                    assistant_generated_reply = computed_final_state.get("final_output", "No response generated.")
+                    
+                    span.update(output=assistant_generated_reply)
+                    
+                except Exception as err:
+                    assistant_generated_reply = f"System lookup failure: {str(err)}"
+                    span.update(level="ERROR", status_message=str(err))
+
+            # 🔒 SECURITY BLOCK: Run outbound guardrails (Medical Deflection)
+            final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
+            
+            # ⚡ CACHE WRITE: Store successful general inquiries
+            if cache_eligible:
+                GENERAL_RESPONSE_CACHE[q_hash] = final_sanitized_ui_response
+            
+            # 🧮 TOKEN TELEMETRY
+            prompt_token_count = count_tokens(user_raw_input)
+            completion_token_count = count_tokens(final_sanitized_ui_response)
+            
+            # Update Langfuse with exact token usage
+            trace.update(
+                output=final_sanitized_ui_response,
+                usage={
+                    "input": prompt_token_count, 
+                    "output": completion_token_count,
+                    "total": prompt_token_count + completion_token_count,
+                    "unit": "TOKENS"
+                }
+            )
+
+            # 📊 PERSISTENT TRANSACTION LOGGING
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                
+                # Save conversation history
+                cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                               (payload.session_id, "user", user_raw_input, now_ts))
+                cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                               (payload.session_id, "assistant", final_sanitized_ui_response, now_ts))
+                
+                # Financial tracking calculation
+                # Rates: $0.05 per 1M Input / $0.08 per 1M Output
+                estimated_cost = (prompt_token_count * (0.05/1000000)) + (completion_token_count * (0.08/1000000))
+                cursor.execute("""
+                    INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (payload.session_id, now_ts, prompt_token_count, completion_token_count, estimated_cost))
+                
+                conn.commit()
+                conn.close()
+            except Exception as db_err:
+                print(f"⚠️ [DATABASE ERROR] Failed to record transaction: {db_err}")
+
+            # Ensure all traces are sent to cloud before closure
+            langfuse.flush()
+
+            # 📺 YIELD TO UI: SSE SSE format for Streamlit consumption
+            yield f"data: {json.dumps({'token': final_sanitized_ui_response})}\n\n"
+            
+            # Clean terminal audit entry
+            print(f"[AUDIT] Ingress: {redact_pii(user_raw_input)} | Egress: {redact_pii(final_sanitized_ui_response)}")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/history/{session_id}")
+def get_session_history(session_id: str):
+    """Retrieves records out of the SQLite conversations table for UI restoration."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        history_list = [{"role": row[0], "content": row[1]} for row in rows]
+        return {
+            "session_id": session_id,
+            "history": history_list
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database retrieval breakdown: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Start production gateway
+    print("🚀 PRODUCTION OBSERVABILITY GATEWAY STARTING ON http://0.0.0.0:8000")
+    print(f"📍 TARGET DATABASE: {DB_PATH}")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+## File: ./mut_main.py
+```python
+import sys
+import os
+import time
+import json
+import sqlite3
+import hashlib
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from typing import Any, List
+from collections import defaultdict
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# --- INITIALIZE ENVIRONMENT & OBSERVABILITY ---
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+# --- PROJECT MODULE IMPORTS ---
+from retrieval_engine import retrieve
+from redact_pii import redact_pii
+from guardrails_config import check_input_guardrail, check_output_guardrail
+from token_utils import count_tokens
+
+app = FastAPI()
+
+# Configuration: Path to your SQLite DB
+DB_PATH = "coverage-chatbot-api/coverage.db"
+
+# ---------------------------------------------------------
+# 1. DATA MODELS (FIXED: Restored ChatRequest)
+# ---------------------------------------------------------
+class ChatRequest(BaseModel):
+    session_id: str
+    member_id: str
+    message: str
+
+# ---------------------------------------------------------
+# 2. DATABASE & LOGIC SETUP (RESTORED)
+# ---------------------------------------------------------
+def init_db():
+    """Initializes the database schema for history and token tracking."""
+    if not os.path.exists(os.path.dirname(DB_PATH)):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            estimated_cost REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Rate Limiting & Hashing Cache
+REQUEST_HISTORY_LOG = defaultdict(list)
+GENERAL_RESPONSE_CACHE = {}
+
+def is_rate_limited(session_id: str) -> bool:
+    """Limits to 5 requests per 60 seconds per session."""
+    current_time = time.time()
+    REQUEST_HISTORY_LOG[session_id] = [t for t in REQUEST_HISTORY_LOG[session_id] if current_time - t < 60.0]
+    if len(REQUEST_HISTORY_LOG[session_id]) >= 5:
+        return True
+    REQUEST_HISTORY_LOG[session_id].append(current_time)
+    return False
+
+def get_question_hash(question: str) -> str:
+    """Creates a unique ID for a query to check the cache."""
+    return hashlib.sha256(question.lower().strip().encode("utf-8")).hexdigest()
+
+def is_eligible_for_caching(question: str) -> bool:
+    """Blocks caching for queries that look like personal member data."""
+    clean_q = question.lower().strip()
+    restricted = ["clm", "claim", "member id", "my policy", "p10", "status of"]
+    return not any(idnt in clean_q for idnt in restricted)
+
+# ---------------------------------------------------------
+# 3. API ENDPOINTS (Observability + Full Logic)
+# ---------------------------------------------------------
+
+@app.get("/health")
+def health_check():
+    """Liveness probe for Kubernetes."""
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+@app.post("/chat")
+async def handle_chat_endpoint(payload: ChatRequest):
+    """
+    Primary API Gateway. 
+    Handles Rate Limiting, Caching, Agent Graph Execution, and Guardrails.
+    """
+    # Start the Langfuse Trace using the context manager
+    with langfuse.start_as_current_observation(
+        name="chat_request",
+        user_id=payload.member_id,
+        session_id=payload.session_id
+    ) as trace:
+        
+        user_raw_input = payload.message
+        
+        # 🔒 RATE LIMIT CHECK
+        if is_rate_limited(payload.session_id):
+            trace.update(status_message="Rate Limited")
+            return {"response": "⚠️ Too many requests. Please pause for a moment."}
+        
+        # 🔒 INBOUND GUARDRAIL CHECK
+        if not check_input_guardrail(user_raw_input):
+            trace.update(status_message="Security Block: Inbound")
+            return {"response": "⚠️ Security Access Exception: Prompt not authorized."}
+
+        # 🚀 CACHE HIT CHECK
+        q_hash = get_question_hash(user_raw_input)
+        cache_eligible = is_eligible_for_caching(user_raw_input)
+        if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
+            cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
+            trace.update(output=cached_reply, metadata={"cache": "hit"})
+            return {"response": cached_reply}
+
+        # 🕸️ AGENT GRAPH EXECUTION
+        with langfuse.start_as_current_observation(name="agent_graph_execution") as span:
+            try:
+                # Late import to keep startup fast
+                from multi_agent import multi_agent_application_mesh
+                
+                initial_state = {
+                    "user_query": user_raw_input,
+                    "messages": [],
+                    "next_node": "",
+                    "final_output": "",
+                    "session_id": payload.session_id
+                }
+                
+                # Invoke the LangGraph State Machine
+                computed_final_state = await multi_agent_application_mesh.ainvoke(initial_state)
+                assistant_generated_reply = computed_final_state.get("final_output", "No response generated.")
+                
+                span.update(output=assistant_generated_reply)
+                
+            except Exception as err:
+                assistant_generated_reply = f"System Error: {str(err)}"
+                span.update(level="ERROR", status_message=str(err))
+
+        # 🔒 OUTBOUND GUARDRAIL CHECK
+        final_response = check_output_guardrail(assistant_generated_reply)
+        
+        # ⚡ CACHE WRITE
+        if cache_eligible:
+            GENERAL_RESPONSE_CACHE[q_hash] = final_response
+        
+        # 🧮 TELEMETRY (Token Counting)
+        p_tokens = count_tokens(user_raw_input)
+        c_tokens = count_tokens(final_response)
+        
+        trace.update(
+            output=final_response,
+            usage={"input": p_tokens, "output": c_tokens, "unit": "TOKENS"}
+        )
+
+        # 📊 PERSIST TO SQLITE
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Log history
+            cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                           (payload.session_id, "user", user_raw_input, now))
+            cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                           (payload.session_id, "assistant", final_response, now))
+            # Log usage (Cost estimated at 0 here, calculated in dashboard)
+            cursor.execute("INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost) VALUES (?, ?, ?, ?, ?)",
+                           (payload.session_id, now, p_tokens, c_tokens, 0.0))
+            conn.commit()
+            conn.close()
+        except Exception as db_err:
+            print(f"Database Logging Error: {db_err}")
+
+        # PII-redacted audit log for console
+        print(f"[AUDIT] {redact_pii(user_raw_input)} -> {redact_pii(final_response)}")
+        
+        langfuse.flush()
+        return {"response": final_response}
+
+@app.get("/history/{session_id}")
+def get_session_history(session_id: str):
+    """Retrieves long-term records for a specific session."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC", (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return {"session_id": session_id, "history": [{"role": r, "content": c} for r, c in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    # Start the server
+    print("🚀 FastAPI Observability Gateway Live on http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+## File: ./mut_tool_callin.py
+```python
+import os
+import sys
+import json
+import sqlite3
+from typing import Optional, List
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field, ValidationError
+from groq import Groq
+import tiktoken
+from dotenv import load_dotenv
+
+# --- INITIALIZE ---
+load_dotenv()
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+DB_PATH_GLOBAL = "coverage-chatbot-api/coverage.db"
+
+# ---------------------------------------------------------
+# 1. PYDANTIC OUTPUT DATA SCHEMAS (RESTORED)
+# ---------------------------------------------------------
+class CoverageValidationModel(BaseModel):
+    plan_id: str = Field(..., min_length=2)
+    procedure: str = Field(..., min_length=3)
+    is_covered: bool
+    limitations: str
+    pre_authorization_required: bool
+
+class ClaimStatusValidationModel(BaseModel):
+    claim_id: str = Field(..., min_length=4)
+    status: str = Field(..., pattern="^(paid|denied|pending_review)$")
+    submitted_amount: float = Field(..., ge=0.0)
+    allowed_amount: Optional[float] = Field(None, ge=0.0)
+    member_responsibility: Optional[float] = Field(None, ge=0.0)
+    insurance_paid: Optional[float] = Field(None, ge=0.0)
+    denial_reason: Optional[str] = None
+
+# ---------------------------------------------------------
+# 2. MOCK DATASETS (RESTORED)
+# ---------------------------------------------------------
+MOCK_COVERAGE = [
+    {"plan_id": "P101", "procedure": "physical therapy", "is_covered": True, "limitations": "20 visits/year", "pre_authorization_required": False},
+    {"plan_id": "P102", "procedure": "acupuncture", "is_covered": False, "limitations": "Excluded", "pre_authorization_required": False}
+]
+
+MOCK_CLAIMS = [
+    {"claim_id": "CLM9901", "status": "paid", "submitted_amount": 450.00, "allowed_amount": 350.00, "member_responsibility": 35.00, "insurance_paid": 315.00, "denial_reason": None}
+]
+
+# ---------------------------------------------------------
+# 3. REALIZATION FUNCTIONS (With Manual Tracing)
+# ---------------------------------------------------------
+def check_coverage(plan_id: str, procedure: str) -> str:
+    with langfuse.start_as_current_observation(name="tool_check_coverage", input={"plan": plan_id}) as span:
+        p_clean = procedure.strip().lower()
+        raw_match = next((i for i in MOCK_COVERAGE if i["plan_id"].upper() == plan_id.strip().upper() and i["procedure"] == p_clean), None)
+        if not raw_match:
+            raw_match = {"plan_id": plan_id, "procedure": procedure, "is_covered": False, "limitations": "No record found.", "pre_authorization_required": False}
+        res = CoverageValidationModel(**raw_match).model_dump_json()
+        span.update(output=res)
+        return res
+
+def get_claim_status(claim_id: str) -> str:
+    with langfuse.start_as_current_observation(name="tool_get_claim_status", input={"claim_id": claim_id}) as span:
+        raw_match = next((i for i in MOCK_CLAIMS if i["claim_id"].upper() == claim_id.strip().upper()), None)
+        if not raw_match: return json.dumps({"error": "Claim not found."})
+        res = ClaimStatusValidationModel(**raw_match).model_dump_json()
+        span.update(output=res)
+        return res
+
+# ---------------------------------------------------------
+# 4. MEMORY COMPRESSION DAEMON (RESTORED)
+# ---------------------------------------------------------
+def prune_and_summarize_session_history(session_id: str, db_path: str, groq_client: Groq):
+    with langfuse.start_as_current_observation(name="memory_compression") as span:
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC", (session_id,))
+            rows = cursor.fetchall()
+            if len(rows) < 15: 
+                conn.close()
+                return
+            
+            digest = "\n".join([f"{r.upper()}: {c}" for r, c in rows[:8]])
+            summary_prompt = f"Summarize concisely as a system log paragraph:\n{digest}"
+            response = groq_client.chat.completions.create(model="openai/gpt-oss-20b", messages=[{"role": "user", "content": summary_prompt}])
+            summary = response.choices[0].message.content
+            
+            # Simplified cleanup for this script
+            cursor.execute("INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+                           (session_id, "system", f"[AUTO-SUMMARY]: {summary}", datetime.now(timezone.utc).isoformat()))
+            conn.commit(); conn.close()
+            span.update(output="Compressed older turns successfully.")
+        except Exception as e:
+            span.update(level="ERROR", status_message=str(e))
+
+# ---------------------------------------------------------
+# 5. AGENT RUNTIME (GPT OSS 20B)
+# ---------------------------------------------------------
+def run_agent_loop(user_query: str, external_context: str = "", stream: bool = True, session_id: str = "DEFAULT-SESS"):
+    ACTIVE_MODEL = "openai/gpt-oss-20b"
+    
+    with langfuse.start_as_current_observation(name="llm_agent_run", input=user_query, metadata={"session_id": session_id}) as generation:
+        api_key = os.environ.get("GROQ_API_KEY")
+        client = Groq(api_key=api_key)
+        
+        # Trigger Memory Management
+        prune_and_summarize_session_history(session_id, DB_PATH_GLOBAL, client)
+
+        messages = [
+            {"role": "system", "content": "You are a professional Health Insurance Navigator. Use provided data. No medical advice."},
+            {"role": "user", "content": user_query}
+        ]
+
+        try:
+            response = client.chat.completions.create(model=ACTIVE_MODEL, messages=messages, temperature=0.0)
+            final_text = response.choices[0].message.content
+            
+            generation.update(
+                output=final_text, model=ACTIVE_MODEL,
+                usage={"input": response.usage.prompt_tokens, "output": response.usage.completion_tokens}
+            )
+
+            if stream:
+                # This is the format the frontend UI expects
+                yield f"data: {json.dumps({'token': final_text})}\n\n"
+            else:
+                return final_text
+
+        except Exception as api_err:
+            generation.update(level="ERROR", status_message=str(api_err))
+            yield f"data: {json.dumps({'error': str(api_err)})}\n\n"
+    langfuse.flush()
+
+# ---------------------------------------------------------
+# LOCAL RUNNER (RESTORED + CLEAN OUTPUT FIX)
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 RUNNING FULL LOGIC AGENT (Clean Output Mode)")
+    print("=" * 60)
+    
+    for sse_line in run_agent_loop("What is my deductible?", session_id="TEST-999"):
+        if sse_line.startswith("data:"):
+            # This parses the 'messy' JSON into clean terminal text
+            raw_data = sse_line.replace("data: ", "").strip()
+            try:
+                json_data = json.loads(raw_data)
+                if "token" in json_data:
+                    print(json_data["token"], end="", flush=True)
+                elif "error" in json_data:
+                    print(f"\n❌ Error: {json_data['error']}")
+            except:
+                pass
+    print("\n" + "-"*60)
 ```
 
 ## File: ./init_pinecone.py
@@ -4042,322 +4286,6 @@ if __name__ == "__main__":
 # 🛡️ Local safety patch: Satisfies the missing RAGAS library boot check
 class ChatVertexAI:
     pass
-
-```
-
-## File: ./coverage-chatbot-api/main.py
-```python
-"""Simple script with a helper to fetch JSON from a URL."""
-
-
-
-import sys
-import os
-import time
-from typing import Any
-import json
-import sqlite3
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
-
-# Ensure parent directory is accessible for local module resolution
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-from retrieval_engine import retrieve
-from tool_calling_chatbot import run_agent_loop
-
-from redact_pii import redact_pii
-from guardrails_config import check_input_guardrail, check_output_guardrail
-
-from token_utils import count_tokens
-from collections import defaultdict
-import time
-import hashlib
-
-
-app = FastAPI()
-
-# ---------------------------------------------------------
-# 1. DATABASE INITIALIZATION: SQLITE STORAGE ENGINE
-# ---------------------------------------------------------
-DB_PATH = "coverage.db"
-
-def init_db():
-    """Initializes the database schema for structural conversation history log tracking."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # Create conversations table with core required columns
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-# Run table initialization on server initialization bootup
-init_db()
-
-class ChatRequest(BaseModel):
-    session_id: str
-    member_id: str
-    message: str
-
-
-import time
-from collections import defaultdict
-
-# Global rate limiting thresholds (Max 5 requests per 60 seconds per session)
-RATE_LIMIT_CEILING = 5
-RATE_LIMIT_WINDOW = 60.0
-REQUEST_HISTORY_LOG = defaultdict(list)
-
-def is_rate_limited(session_id: str) -> bool:
-    """Checks sliding window request counts for the current session."""
-    current_time = time.time()
-    # Purge old records outside the active 60s window frame
-    REQUEST_HISTORY_LOG[session_id] = [t for t in REQUEST_HISTORY_LOG[session_id] if current_time - t < RATE_LIMIT_WINDOW]
-    
-    if len(REQUEST_HISTORY_LOG[session_id]) >= RATE_LIMIT_CEILING:
-        return True
-        
-    REQUEST_HISTORY_LOG[session_id].append(current_time)
-    return False
-
-# Global In-Memory Exact Match Data Cache
-GENERAL_RESPONSE_CACHE = {}
-
-def get_question_hash(question: str) -> str:
-    """Normalizes the string and computes a secure SHA-256 hex string hash."""
-    normalized = question.lower().strip()
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-def is_eligible_for_caching(question: str) -> bool:
-    """
-    SECURITY FILTER: Determines if a query can be safely cached.
-    Explicitly blocks member-specific questions containing claim or tracking identifiers.
-    """
-    clean_q = question.lower().strip()
-    
-    # Identify high-risk personal search patterns
-    restricted_identifiers = [
-        "clm", "claim", "member id", "my policy", "my balance", 
-        "status of", "p10", "p11", "em9", "john doe"
-    ]
-    
-    for identifier in restricted_identifiers:
-        if identifier in clean_q:
-            print(f"🔒 [CACHE BYPASS] Query contains member-specific identifier '{identifier}'. Disabling cache.")
-            return False
-            
-    return True
-
-# ---------------------------------------------------------
-# 2. CARDS + STREAMING PIPELINE ENDPOINT (POST /chat)
-# ---------------------------------------------------------
-@app.post("/chat")
-async def handle_chat_endpoint(payload: ChatRequest):
-    """
-    POST /chat endpoint. Hardened against crashes, protected by security guardrails,
-    rate-limited per session, optimized with tiktoken tracking, and accelerated with a
-    privacy-aware exact-match general query cache.
-    """
-    start_time = time.perf_counter()
-    user_raw_input = payload.message
-    
-    # 🔒 RATE LIMIT GATEWAY: Intercept spam attempts at the absolute front door
-    if is_rate_limited(payload.session_id):
-        print(f"⚠️ [RATE LIMIT TRIGGER] Denied request stream block for session: {payload.session_id}")
-        return {
-            "response": "⚠️ Too many requests. You have exceeded our security standard of 5 requests per minute. Please pause and try your question again in a few moments."
-        }
-    
-    # 🧮 STEP 1: CALCULATE THE RAW INBOUND PROMPT TOKEN SIZE IMMEDIATELY
-    prompt_token_count = count_tokens(user_raw_input)
-    
-    # 🔒 SAFE INTERCEPTION GATE: Returns a clean string if input fails validation
-    if not check_input_guardrail(user_raw_input):
-        print("🛡️ [SECURITY INTERCEPT] Inbound block executed. Preventing loop run.")
-        print(f"[METRIC LOG] Intercepted Prompt Token Size: {prompt_token_count}")
-        return {"response": "⚠️ Security Access Exception: Malicious, off-topic, or unapproved prompt signature detected."}
-
-    # 🚀 CACHE READ HIT CLOSURE: Evaluate exact-match general coverage shortcuts
-    q_hash = get_question_hash(user_raw_input)
-    cache_eligible = is_eligible_for_caching(user_raw_input)
-    
-    if cache_eligible and q_hash in GENERAL_RESPONSE_CACHE:
-        cached_reply = GENERAL_RESPONSE_CACHE[q_hash]
-        print(f"⚡ [CACHE HIT] Serving optimized, zero-token response for: '{user_raw_input}'")
-        
-        # Log zero tokens for the outbound trace logging records
-        print(f"[AUDIT TRACE LOG] Ingress: {redact_pii(user_raw_input)} | Egress (CACHED): {redact_pii(cached_reply)}")
-        return {"response": cached_reply}
-    
-    # Run database index lookups using raw string variables (Cache Miss Path)
-    retrieval_payload = retrieve(user_raw_input)
-    context_block = retrieval_payload.get("context_block", "")
-    
-    # Extract chunk IDs from metadata
-    chunk_ids = retrieval_payload.get("chunk_ids", [])
-    if not chunk_ids and "source_nodes" in retrieval_payload:
-        chunk_ids = [node.get("id") or node.get("node_id") for node in retrieval_payload["source_nodes"]]
-    if not chunk_ids:
-        chunk_ids = ["CHK-E9A3", "CHK-4B1C"]
-        
-    # Persist raw message parameters into SQLite history tables safely
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO conversations (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (payload.session_id, "user", user_raw_input, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as db_err:
-        print(f"[DB ERROR] Failed to record transaction: {str(db_err)}")
-
-    # ----------------------------------------------------------------------
-    # 🕸️ CORE COGNITION GENERATION LOOP BLOCK: CONNECT THE REAL AGENT GRAPH
-    # ----------------------------------------------------------------------
-    try:
-        # Import your actual live agent app instance from your multi-agent module
-        from multi_agent import multi_agent_application_mesh
-        
-        # Package your active request inputs straight into your formal state dict
-        initial_graph_state = {
-            "user_query": user_raw_input,
-            "messages": [],
-            "next_node": "",
-            "final_output": "",
-            "session_id": payload.session_id
-        }
-        
-        print(f"🕸️ [LIVE GRAPH INVOKE] Running multi-agent application mesh flow dynamically...")
-        
-        # Invoke your existing agent mesh over async threads natively
-        computed_final_state = await multi_agent_application_mesh.ainvoke(initial_graph_state)
-        
-        # Extract the real ground-truth generated text value into your output channel
-        assistant_generated_reply = computed_final_state.get("final_output", "Error: No final output computed by graph.")
-        
-    except Exception as err:
-        print(f"⚠️ [GRAPH ERROR] Failed running live multi-agent execution pipeline: {str(err)}")
-        assistant_generated_reply = f"System lookup failure: Multi-agent compilation interrupted. Error: {str(err)}"
-        
-    # 🔒 SECURITY STEP 2: RUN THE GENERATION THROUGH OUTBOUND GUARDRAILS
-    final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
-    
-    # ⚡ CACHE WRITE PATH: Store the response safely if the question is generic coverage
-    if cache_eligible:
-        GENERAL_RESPONSE_CACHE[q_hash] = final_sanitized_ui_response
-        print(f"💾 [CACHE WRITE] Saved general coverage response hash key entry down to memory index.")
-    
-    # 🧮 STEP 3: CALCULATE THE SAFELY SANITIZED OUTBOUND COMPLETION TOKEN SIZE
-    completion_token_count = count_tokens(final_sanitized_ui_response)
-    
-    # 📊 STEP 4: LOG THE COMBINED TRANSACTION PERFORMANCE AND PRICING METRICS
-    total_turn_tokens = prompt_token_count + completion_token_count
-    input_rate_per_token = 0.05 / 1_000_000
-    output_rate_per_token = 0.08 / 1_000_000
-    estimated_cost = (prompt_token_count * input_rate_per_token) + (completion_token_count * output_rate_per_token)
-    current_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    # PERSISTENT METRIC LOGGING TRANSACTION BLOCK
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO token_usage (session_id, timestamp, input_tokens, output_tokens, estimated_cost)
-            VALUES (?, ?, ?, ?, ?)
-        """, (payload.session_id, current_timestamp, prompt_token_count, completion_token_count, estimated_cost))
-        conn.commit()
-        conn.close()
-    except Exception as db_metric_err:
-        print(f"⚠️ [METRIC LOG ERROR] Failed to record token analytics to SQLite: {str(db_metric_err)}")
-    
-    print(f"\n" + "="*15 + " 📊 REAL-TIME TURN TOKEN METRICS " + "="*15)
-    print(f"▶ Inbound Prompt footprint:      {prompt_token_count} tokens")
-    print(f"▶ Outbound Completion footprint:  {completion_token_count} tokens")
-    print(f"▶ Total Single-Turn Footprint:   {total_turn_tokens} tokens")
-    print(f"▶ Financial Transaction Expense: ${estimated_cost:.8f}")
-    print("="*60 + "\n")
-    
-    # Anonymize analytical text fields for secure trace log storage dumps (Scenario 1)
-    safe_log_prompt = redact_pii(user_raw_input)
-    safe_log_response = redact_pii(final_sanitized_ui_response)
-    print(f"[AUDIT TRACE LOG] Ingress: {safe_log_prompt} | Egress: {safe_log_response}")
-    
-    return {"response": final_sanitized_ui_response}
-    # ----------------------------------------------------------------------
-    # GENERATION EXECUTION STEP
-    # ----------------------------------------------------------------------
-    # Execute your agent graph mesh or generation engine using the input string
-    try:
-        # Replace this string placeholder with your actual live generation engine execution variable!
-        assistant_generated_reply = "Based on your chart details, you should take aspirin for that symptom."
-    except Exception as err:
-        assistant_generated_reply = f"System lookup failure: {str(err)}"
-    
-    # 🔒 FIXED OUTBOUND PERIMETER INTERACTION:
-    # Forces the newly generated answer string through your output filters before it reaches the UI
-    final_sanitized_ui_response = check_output_guardrail(assistant_generated_reply)
-    
-    # Anonymize analytical data records for trace log storage dumps (Scenario 1)
-    safe_log_prompt = redact_pii(user_raw_input)
-    safe_log_response = redact_pii(final_sanitized_ui_response)
-    print(f"[AUDIT TRACE LOG] Ingress: {safe_log_prompt} | Egress: {safe_log_response}")
-    
-    # Return the clean, safely verified response dictionary back down the route
-    return {"response": final_sanitized_ui_response}
-
-
-@app.get("/history/{session_id}")
-def get_session_history(session_id: str):
-    """Fetches long-term records directly out of the SQLite conversations table database matrix."""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id ASC",
-            (session_id,)
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        
-        history_list = [{"role": row[0], "content": row[1]} for row in rows]
-        return {
-            "session_id": session_id,
-            "history": history_list
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database retrieval breakdown: {str(e)}")
-
-
-def fetch_json(url: str, timeout: int = 10) -> Any:
-    """Fetch the given URL and return the parsed JSON."""
-    req = urllib.request.Request(url, headers={"User-Agent": "python-urllib/3"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset(failobj="utf-8")
-        data = resp.read().decode(charset)
-        return json.loads(data)
-
-
-if __name__ == "__main__":
-    try:
-        sample = fetch_json("https://typicode.com")
-        print("Fetched JSON:", sample)
-    except Exception as e:
-        print("Error fetching JSON:", e)
 
 ```
 

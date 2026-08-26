@@ -39,7 +39,13 @@ Secrets: Secure injection of Groq and Langfuse API keys.
 Probes: Liveness and Readiness probes ensure the backend has loaded heavy ML models before accepting traffic.
 
 
-program-repo/
+
+### 📄 Project repo structure
+
+<details>
+<summary>Project repo structure</summary>
+
+```program-repo/
 ├── k8s/                         # Kubernetes manifests (Deployments, Services)
 ├── coverage-chatbot-api/        # Core Data (coverage.db, plans.csv)
 ├── main.py                      # FastAPI Streaming SSE Gateway
@@ -50,6 +56,10 @@ program-repo/
 ├── app.py                       # Streamlit Frontend UI
 ├── Dockerfile                   # Multi-stage Backend Build
 └── .dockerignore                # Critical for cluster performance
+```
+
+</details>
+
 
 🛠️ Observability & Debugging
 The system is integrated with Langfuse v4 using a manual stateful client approach. This provides a "thought-trace" for every user query, showing exactly how the Supervisor decided on a route and how the Specialist formulated the answer.
